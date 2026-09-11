@@ -4,7 +4,7 @@ Working design for an out-of-process “servlet filter” hop on the MITM proxy:
 
 This file is a **local working spec**, not upstream docs. Canonical copy for Infisical: https://github.com/Infisical/agent-vault/issues/407. Do not include `ad_hoc/` in the pull request. After merge, operator-facing behavior belongs in Mintlify (`docs/learn/services.mdx`, CLI reference), not this plan.
 
-Status: **revised after Codex’s review of the Cursor hybrid** (`codex-on-cursor-review.md` / `codex-plan-amendments.md` on `issue-407-codex`). Cursor concurred. The implementation on `issue-407-cursor` still matches the *original* mint-at-config agent spec and must be rewritten against this document before a PR. Local working copy; do not include `ad_hoc/` in the pull request.
+Status: **revised after `codex_remaining_security_details.md`** (revocation + frozen-match snapshot). Ready for Codex to confirm concurrence. The implementation on `issue-407-cursor` still matches the *original* mint-at-config agent spec and must be rewritten against this document before a PR. Local working copy; do not include `ad_hoc/` in the pull request.
 
 ---
 
@@ -27,6 +27,15 @@ Cursor concurred with three refinements and two smaller protocol fixes:
 | **Shared** TTL capability state in the existing DB (token **hash**, atomic consume). Process-local map is a documented single-instance/dev backend only. | Sticky MITM is a footgun once `DATABASE_URL` means multiple processes. A write on the **filtered** path is acceptable (already an extra sidecar RTT); it must not appear on unfiltered Inject. |
 | Split `*-Proxy` (URL, no secret) from `*-Token` (bearer). | Capability-in-URL leaks in access logs. |
 | Policy cap cannot invoke **any** filtered service (not “skip that filter only”). | Nested filter hops would mint another capability. A git sidecar calling filtered OpenAI with the policy cap **fails**, rather than starting a second filter. |
+
+### After `codex_remaining_security_details.md`
+
+Both items adopted. They specify implementation of locks we already had (audit as initiator; frozen match), not new product modes.
+
+| Change | Why |
+|---|---|
+| Immediate invalidation of issued capabilities when the **source session/agent** is revoked, expired, or removed — including each request on a CONNECT tunnel | 30s is a maximum lifetime, not a post-revoke grace period. Same fail-closed expectation as ordinary `agent revoke`. |
+| Versioned, non-secret **frozen-match snapshot** in the capability row (key names, never values). Do not re-run the matcher. | Shared store cannot hold an in-process pointer. YAML/key-name edits must not retarget the slot; `credential set` on the frozen **key** still attaches the new value. |
 
 ---
 
@@ -143,11 +152,11 @@ Admin `vault service list` **must include** `url`, `policy_vault`, and `allow_in
 
 Do **not** forward the inbound `Proxy-Authorization` / agent A session to the sidecar. Do **not** create an agent row.
 
-Both capabilities: random opaque tokens. **Production:** shared TTL rows in the existing database (store a **hash** of the token, expiry, kind, issued/claimed/consumed, initiating actor, vault scope, frozen non-secret match, exact URL bind). **No credential values.** Atomic conditional update claims/consumes a continuation **once** across replicas. Expired rows swept opportunistically and on a schedule.
+Both capabilities: random opaque tokens. **Production:** shared TTL rows in the existing database. **No credential values, no raw tokens, no reversible token material.** Atomic conditional update claims/consumes a continuation **once** across replicas. Expired rows swept opportunistically and on a schedule. Treat the row as sensitive **policy metadata** (actor, key names); it is not a secret store.
 
 **Development:** a process-local map with **identical semantics** is allowed only as an explicit single-instance optimization. It is not the production design.
 
-Audit and rate-limit attribution stay the **initiating actor**.
+Audit and rate-limit attribution stay the **initiating actor**. Revocation of that actor’s session or agent **immediately** invalidates outstanding capabilities (see below).
 
 This write happens only on the **filtered** path. Unfiltered Inject stays decrypt-and-forward with no capability row.
 
@@ -174,6 +183,50 @@ It **cannot**:
 - outlive 30s.
 
 It **can** use **unfiltered** services in that vault. Stolen same-vault policy cap can still hit other unfiltered write services for 30s; it **cannot** `git push` on `github-push` and **cannot** drive a filtered OpenAI hop. Layout B (read-only policy vault) removes the residual.
+
+### 3. Revocation (source authority, not capability TTL)
+
+Thirty seconds is a **maximum** capability lifetime, not a permitted window after the inbound actor is revoked.
+
+The capability row records **source session and/or agent identity** in addition to actor and vault scope.
+
+Agent Vault re-checks that this source authority is still **active** and **authorized for the source vault**:
+
+- when authenticating a policy-capability request;
+- when **consuming** a continuation;
+- on **each** new request through a persistent CONNECT tunnel that is using a policy capability — not only when the tunnel is opened.
+
+Revocation, expiry, or removal of that session/agent → fail closed, even if the capability TTL has not elapsed. A revoked capability cannot be revived by opening a new CONNECT. The in-flight client hop to the sidecar fails closed when continuation/policy is rejected (`filter_misconfigured` / unauthorized — no dest Resolve).
+
+This is the same operator expectation as ordinary `agent revoke`: authority is gone now, not in ≤30s.
+
+### 4. Frozen-match snapshot (shared-store format)
+
+A replica cannot store an in-process `CredentialMatch` pointer. The capability row holds a **versioned, non-secret snapshot** from which Agent Vault reconstructs an immutable match at consume time. It **must not** re-run service matching against current mutable YAML.
+
+Required record:
+
+| Field | Notes |
+|---|---|
+| Format version | Unknown or unsupported version → fail closed, no dest decrypt |
+| Source vault id | |
+| Initiating actor + **session/agent id** | Used for audit and revocation checks |
+| Kind, token **hash**, expiry, issued/claimed/consumed | Atomic consume |
+| Exact request bind | method, scheme, authority, escaped path, query |
+| Canonical matched service | name, host, path, port |
+| Non-secret auth + substitution snapshot | Credential **key names** only — never values |
+| Policy-vault scope | When kind is policy |
+
+At continuation consume: rebuild the internal match from this snapshot, re-check source authority (above), then **Resolve those key names** against the source vault’s current credential store.
+
+| Admin change during the 30s window | Continuation |
+|---|---|
+| Host / path / name / auth **key** / substitutions | **Frozen** — cannot retarget which slot is used |
+| Credential **value** (`vault credential set KEY=…`) | **Not frozen** — Resolve uses the current value for the frozen key name |
+| Filter block | Irrelevant — continuation does not re-enter the filter |
+| Key deleted from the vault | Fail closed (missing credential), no origin |
+
+Malformed, incomplete, expired, or inconsistent snapshots fail closed without credential reads. Logs and DB access controls treat the snapshot as sensitive policy metadata. Rows and request logs must never contain decrypted credentials, raw capability tokens, or reversible forms of either.
 
 ---
 
@@ -303,11 +356,11 @@ A Layout A HTTP smoke (`TestSmoke_FilterLayoutA`, `make test-smoke`) exists for 
 - `broker.Service`: `Filter` `{url, policy_vault, allow_insecure_private_http}`; URL + opt-in HTTP validation; no `agent_id`.
 - `proposal.MergeServices`: preserve `filter`; never take `filter` from proposals; **reject delete** of a filtered service.
 - `brokercore`: **Match** vs **Resolve**; frozen match on continuation; no dest decrypt on the filter path.
-- Store: capability table (hash, TTL, kind, consume state, actor, vault, match, URL bind). Atomic claim/consume. No secrets. Optional in-memory backend for single-instance dev.
+- Store: capability table (format version, token hash, TTL, kind, consume state, actor, **session/agent id**, vault, frozen-match snapshot, URL bind). Atomic claim/consume. No secrets. Optional in-memory backend for single-instance dev. Revoke/expiry of source session/agent fails subsequent uses.
 - `mitm`: reverse-proxy to `filter.url`; CONNECT claim; token vs proxy-URL headers; strip `X-Agent-Vault-*` both ways; dedicated dialer + private-HTTP flag; filtered WS reverse-proxy + continuation bridge.
 - `server` / `cmd/server`: dual-admin if `policy_vault` differs; omit `policy_vault` → no policy cap; `AGENT_VAULT_FILTER_PROXY_URL`.
 - CLI: none beyond YAML parse/print. Docs: file-only; `set`/`clear` wipe warning; Layout A residual; private-HTTP weaker than TLS.
-- Tests: no dest decrypt on deny; single-use / exact URL / replay; retained match; dual-admin; omitted `policy_vault` mints no cap; policy cap cannot hit any filtered service; proposal preserve + no-delete; header overwrite; 502 on dead sidecar; WS unfiltered unchanged; filtered WS bridge; loopback HTTP vs flagged RFC1918 vs public HTTPS; multi-replica atomic consume (or store fake).
+- Tests: no dest decrypt on deny; single-use / exact URL / replay; retained match; dual-admin; omitted `policy_vault` mints no cap; policy cap cannot hit any filtered service; proposal preserve + no-delete; header overwrite; 502 on dead sidecar; WS unfiltered unchanged; filtered WS bridge; loopback HTTP vs flagged RFC1918 vs public HTTPS; multi-replica atomic consume (or store fake); **revoke source agent/session rejects policy + continuation**; revoked cap cannot be revived via new CONNECT; YAML/key-name edit after issuance does not change frozen slot; **value rotation of the frozen key still attaches the new secret**; unknown/malformed snapshot versions fail closed with no dest decrypt; rows and logs contain no values or raw tokens.
 
 ---
 
@@ -327,8 +380,10 @@ A Layout A HTTP smoke (`TestSmoke_FilterLayoutA`, `make test-smoke`) exists for 
 12. Hidden from `/discover` / skill. Proposals cannot set, clear, or delete filters/filtered services.
 13. Preserve on `service add` omit; wipe on `set`/`clear`. List prints `filter`.
 14. YAML only (substitutions precedent).
-15. Production capabilities are **shared DB TTL rows** (hash + atomic consume). Process-local is dev/single-instance only. No capability write on unfiltered Inject.
-16. No RFC 9457 in this change.
+15. Production capabilities are **shared DB TTL rows** (hash + atomic consume + versioned frozen-match snapshot + source session/agent id). Process-local is dev/single-instance only. No capability write on unfiltered Inject.
+16. Source session/agent revoke, expiry, or removal **immediately** invalidates issued capabilities (re-check on policy auth, continuation consume, and each CONNECT request). 30s is not a post-revoke grace period.
+17. Frozen snapshot: key names and matcher identity, never values. Do not re-run match. Resolve current values for frozen keys. Unknown snapshot version fails closed.
+18. No RFC 9457 in this change.
 
 ---
 
