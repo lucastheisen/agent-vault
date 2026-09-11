@@ -223,6 +223,8 @@ func attachMITMIfEnabled(srv *server.Server, host string, mitmPort int, masterKe
 			CA:               caProv,
 			Sessions:         srv.SessionResolver(),
 			Credentials:      srv.CredentialProvider(),
+			Tickets:          srv.TicketSigner(),
+			FilterTokens:     srv,
 			BaseURL:          srv.BaseURL(),
 			Logger:           srv.Logger(),
 			RateLimit:        srv.RateLimit(),

@@ -567,6 +567,8 @@ description: "Complete reference for all Agent Vault CLI commands."
     To layer two credentials on the same host, give them different inline paths in `--host` (e.g. Slack with `slack.com/api/*` for the Bot token and `slack.com/api/apps.connections.*` for Socket Mode). The matcher resolves overlapping rules deterministically — see [Matching priority](/learn/services#matching-priority).
 
     URL [substitutions](/learn/services#substitutions) are file-only — there are no flags. Configure them under the `substitutions:` block of a service entry in a YAML file passed via `-f`.
+
+    [Request filters](/learn/services#request-filters) are also file-only. Add a `filter:` block (`url`, optional `vault`) on a service. `vault service add` preserves an existing filter when the YAML omits `filter`; `vault service set` and `vault service clear` replace the whole list and will drop filters that are not in the file.
   </Accordion>
 
   <Accordion title="agent-vault vault service enable">

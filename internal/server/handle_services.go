@@ -414,12 +414,25 @@ func (s *Server) handleServicesUpsert(w http.ResponseWriter, r *http.Request) {
 	var upserted []string
 	for _, svc := range incomingSlice {
 		if idx, ok := byName[svc.Name]; ok {
-			existing[idx] = svc
+			dst := existing[idx]
+			keep := dst.Filter
+			dst = svc
+			dst.Filter = keep
+			broker.ApplyFilterWrite(&dst, svc)
+			existing[idx] = dst
 		} else {
+			if svc.FilterOp == broker.FilterOpClear {
+				svc.Filter = nil
+			}
 			byName[svc.Name] = len(existing)
 			existing = append(existing, svc)
 		}
 		upserted = append(upserted, svc.Name)
+	}
+
+	if err := s.provisionFilters(ctx, actor.ID, ns, existing); err != nil {
+		jsonError(w, http.StatusBadRequest, err.Error())
+		return
 	}
 
 	servicesJSON, err := json.Marshal(existing)
@@ -432,6 +445,7 @@ func (s *Server) handleServicesUpsert(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusInternalServerError, "Failed to set services")
 		return
 	}
+	s.releaseUnusedFilterAgents(ctx)
 
 	s.captureEvent(r, "av.service-add", actor, map[string]string{"vault": name})
 	jsonOK(w, map[string]interface{}{
@@ -507,6 +521,7 @@ func (s *Server) handleServiceRemove(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusInternalServerError, "Failed to update services")
 		return
 	}
+	s.releaseUnusedFilterAgents(ctx)
 
 	s.captureEvent(r, "av.service-remove", actor, map[string]string{"vault": name})
 	jsonOK(w, map[string]interface{}{
@@ -614,7 +629,8 @@ func (s *Server) handleServicesSet(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Setting services requires admin role.
-	if _, err := s.requireVaultAdmin(w, r, ns.ID); err != nil {
+	actor, err := s.requireVaultAdmin(w, r, ns.ID)
+	if err != nil {
 		return
 	}
 
@@ -643,12 +659,6 @@ func (s *Server) handleServicesSet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	servicesJSON, err := json.Marshal(services)
-	if err != nil {
-		jsonError(w, http.StatusInternalServerError, "Failed to marshal services")
-		return
-	}
-
 	unlock, err := s.lockVault(ctx, ns.ID)
 	if err != nil {
 		jsonError(w, http.StatusInternalServerError, "lock failed")
@@ -656,10 +666,22 @@ func (s *Server) handleServicesSet(w http.ResponseWriter, r *http.Request) {
 	}
 	defer unlock()
 
+	if err := s.provisionFilters(ctx, actor.ID, ns, services); err != nil {
+		jsonError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	servicesJSON, err := json.Marshal(services)
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, "Failed to marshal services")
+		return
+	}
+
 	if _, err := s.store.SetBrokerConfig(ctx, ns.ID, string(servicesJSON)); err != nil {
 		jsonError(w, http.StatusInternalServerError, "Failed to set services")
 		return
 	}
+	s.releaseUnusedFilterAgents(ctx)
 
 	jsonOK(w, map[string]interface{}{"vault": name, "services_count": len(services)})
 }
@@ -690,6 +712,7 @@ func (s *Server) handleServicesClear(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusInternalServerError, "Failed to clear services")
 		return
 	}
+	s.releaseUnusedFilterAgents(ctx)
 
 	jsonOK(w, map[string]interface{}{"vault": name, "cleared": true})
 }

@@ -360,6 +360,12 @@ func patchServiceEnabled(cmd *cobra.Command, ref string, enabled bool) error {
 
 // loadServicesFromFile parses a services YAML file ("-" for stdin) and
 // applies the inline-host split. Validation runs server-side.
+//
+// YAML is converted to JSON, then decoded with encoding/json. The HTTP
+// API and persisted broker config are JSON-only; this is the CLI
+// adapter, not a second schema. Decoding YAML straight into
+// broker.Service would lose `filter: null` (nil pointer + omitempty
+// looks like "field omitted" → preserve).
 func loadServicesFromFile(filePath, vault string) ([]broker.Service, error) {
 	var data []byte
 	var err error
@@ -371,8 +377,12 @@ func loadServicesFromFile(filePath, vault string) ([]broker.Service, error) {
 	if err != nil {
 		return nil, fmt.Errorf("reading file: %w", err)
 	}
+	js, err := yamlToJSON(data)
+	if err != nil {
+		return nil, fmt.Errorf("parsing yaml: %w", err)
+	}
 	var cfg broker.Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	if err := json.Unmarshal(js, &cfg); err != nil {
 		return nil, fmt.Errorf("parsing yaml: %w", err)
 	}
 	cfg.Vault = vault
@@ -382,6 +392,17 @@ func loadServicesFromFile(filePath, vault string) ([]broker.Service, error) {
 		}
 	}
 	return cfg.Services, nil
+}
+
+// yamlToJSON re-encodes YAML as JSON so nulls and empty objects survive
+// into UnmarshalJSON. yaml.Unmarshal into interface{} maps `null` to
+// nil; json.Marshal then emits `"filter":null`.
+func yamlToJSON(data []byte) ([]byte, error) {
+	var v interface{}
+	if err := yaml.Unmarshal(data, &v); err != nil {
+		return nil, err
+	}
+	return json.Marshal(v)
 }
 
 func readStdin() ([]byte, error) {

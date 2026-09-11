@@ -7,7 +7,8 @@ An HTTP brokerage layer for AI agents. Sits between development agents (Claude C
 ```bash
 make build        # Builds frontend (React/Vite) then Go binary → ./agent-vault
 make web-dev      # Frontend-only hot reload (Vite on 5173, proxies API to Go on 14321)
-make test         # go test ./...
+make test       # go test ./...
+make test-smoke # tagged Layout A filter hop (MITM + sidecar + origin; not in make test)
 make docker       # Multi-stage Docker image; data persisted at /data/.agent-vault/
 ```
 

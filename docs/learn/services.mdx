@@ -256,6 +256,30 @@ Substitutions and auth are independent. A service can use either, both, or neith
   substitutions; to clear them, delete and recreate the service.
 </Warning>
 
+## Request filters
+
+A **filter** is an optional sidecar hop on a matched service. After Agent Vault matches the service and **before** it injects credentials, it reverse-proxies the live request to `filter.url`. The sidecar may return any HTTP response to the client (including 403) or complete the call through Agent Vault: either as the minted filter-agent, or with a one-shot continuation ticket on a **new** request to the same method/host/path (the ticket does not hold the original body).
+
+Filters are an operator implementation detail: they do not appear on `/discover`, cannot be set by [proposals](/learn/proposals), and have no CLI flags (YAML-only, same as substitutions).
+
+```yaml
+services:
+  - name: github-push
+    host: github.com/*/git-receive-pack
+    auth:
+      type: bearer
+      token: GITHUB_TOKEN
+    filter:
+      url: http://127.0.0.1:12345
+      vault: policy   # optional; defaults to this service's vault
+```
+
+- `url` — http(s) origin of the sidecar (loopback is allowed on this hop).
+- `vault` — vault the minted `filter-…` agent is granted **proxy** on. Omit to use the same vault (logic in front of the same credentials).
+- Agent Vault mints a visible agent named `filter-<vault>-<hash>` (the `filter-` prefix is reserved) and shares it across services with the same `url` + `vault`.
+- `vault service add` **preserves** a filter when YAML omits `filter`. Clear with `filter: {}` or `filter: null`. **`vault service set` / `clear` replace the list** and drop omitted filters.
+- If the sidecar is down or the filter-agent is revoked, the client request fails closed (502/504). Re-apply the YAML to remint a revoked filter-agent.
+
 ## Matching rules
 
 The `host` pattern is the single matcher knob. It can carry just a hostname (`api.stripe.com`), a wildcard host (`*.github.com`), an inline path glob (`slack.com/api/*`), or a port-scoped form (`internal.corp.com:3000` or `internal.corp.com:3000/api/*`).

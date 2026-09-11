@@ -26,15 +26,18 @@ func TestIsHopByHop(t *testing.T) {
 }
 
 func TestIsBrokerScopedRequestHeader(t *testing.T) {
+	// Lowercase names lock CanonicalHeaderKey folding. Do not replace
+	// those rows when adding hop headers.
 	cases := map[string]bool{
-		"X-Vault":             true,
-		"x-vault":             true,
-		"Proxy-Authorization": true,
-		"proxy-authorization": true,
-		"Authorization":       false,
-		"Cookie":              false,
-		"Content-Type":        false,
-		"X-Request-Id":        false,
+		"X-Vault":                    true,
+		"x-vault":                    true,
+		"Proxy-Authorization":        true,
+		"proxy-authorization":        true,
+		"X-Agent-Vault-Filter-Token": true,
+		"Authorization":              false,
+		"Cookie":                     false,
+		"Content-Type":               false,
+		"X-Request-Id":               false,
 	}
 	for name, want := range cases {
 		if got := IsBrokerScopedRequestHeader(name); got != want {

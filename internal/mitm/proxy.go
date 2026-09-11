@@ -28,8 +28,8 @@ package mitm
 
 import (
 	"context"
-	"log/slog"
 	"crypto/tls"
+	"log/slog"
 	"net"
 	"net/http"
 	"sync/atomic"
@@ -48,8 +48,11 @@ type Proxy struct {
 	ca               ca.Provider
 	sessions         brokercore.SessionResolver
 	creds            brokercore.CredentialProvider
+	tickets          *brokercore.TicketSigner
+	filterTokens     FilterTokenSource
 	httpServer       *http.Server
 	upstream         *http.Transport
+	filterTransport  *http.Transport
 	isListening      atomic.Bool
 	baseURL          string // externally-reachable control-plane URL for help links
 	logger           *slog.Logger
@@ -57,6 +60,11 @@ type Proxy struct {
 	logSink          requestlog.Sink     // never nil (Nop default); shared with the HTTP server
 	maxResponseBytes int64               // 0 = unlimited
 	maxRequestBytes  int64
+}
+
+// FilterTokenSource loads the mint-at-config raw token for a filter-agent.
+type FilterTokenSource interface {
+	FilterAgentToken(ctx context.Context, agentID string) (raw string, err error)
 }
 
 // Options carries the dependencies a Proxy needs. BaseURL is the
@@ -69,6 +77,8 @@ type Options struct {
 	CA               ca.Provider
 	Sessions         brokercore.SessionResolver
 	Credentials      brokercore.CredentialProvider
+	Tickets          *brokercore.TicketSigner
+	FilterTokens     FilterTokenSource
 	BaseURL          string
 	Logger           *slog.Logger
 	RateLimit        *ratelimit.Registry
@@ -82,6 +92,16 @@ type Options struct {
 func New(addr string, opts Options) *Proxy {
 	upstream := &http.Transport{
 		DialContext:           netguard.SafeDialContext(netguard.AllowPrivateFromEnv()),
+		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
+		ForceAttemptHTTP2:     false,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 5 * time.Minute,
+	}
+	// Filter hop: allow loopback/private/public; IMDS still blocked.
+	filterTransport := &http.Transport{
+		DialContext:           netguard.SafeDialContext(true),
 		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
 		ForceAttemptHTTP2:     false,
 		MaxIdleConns:          100,
@@ -104,7 +124,10 @@ func New(addr string, opts Options) *Proxy {
 		ca:               opts.CA,
 		sessions:         opts.Sessions,
 		creds:            opts.Credentials,
+		tickets:          opts.Tickets,
+		filterTokens:     opts.FilterTokens,
 		upstream:         upstream,
+		filterTransport:  filterTransport,
 		baseURL:          opts.BaseURL,
 		logger:           opts.Logger,
 		rateLimit:        opts.RateLimit,

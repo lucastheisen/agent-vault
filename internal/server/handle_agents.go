@@ -59,6 +59,10 @@ func (s *Server) handleAgentCreate(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, "Agent name must be 3-64 characters, lowercase alphanumeric and hyphens only")
 		return
 	}
+	if broker.IsReservedFilterAgentName(req.Name) {
+		jsonError(w, http.StatusBadRequest, reservedFilterAgentNameError(req.Name))
+		return
+	}
 
 	type resolvedVault struct {
 		VaultID   string
@@ -396,6 +400,10 @@ func (s *Server) handleAgentRename(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := broker.ValidateSlug(body.Name); err != nil {
 		jsonError(w, http.StatusBadRequest, "Agent name must be 3-64 characters, lowercase alphanumeric and hyphens only")
+		return
+	}
+	if broker.IsReservedFilterAgentName(body.Name) {
+		jsonError(w, http.StatusBadRequest, reservedFilterAgentNameError(body.Name))
 		return
 	}
 

@@ -34,6 +34,7 @@ Features:
 - **Transparent Integration**: Let AI agents use existing tools like MCP, CLI, SDK, API with all underlying requests automatically routed through Agent Vault. Agent Vault takes an interface-agnostic, non-invasive approach to credential brokering by bootstrapping your agents' environment to use `HTTPS_PROXY` and be compatible with Agent Vault's MITM architecture.
 - **Purpose-Built Design**: Existing forward proxies like `mitmproxy` or `squid` require modification to perform credential brokering and integrate well with agents. Agent Vault is purpose-built to work with the ergonomics of all types of agent use-cases with a dedicated CLI, multi-tenancy, and agent-specific roadmap backed by [Infisical](https://github.com/Infisical/infisical).
 - **Egress Filtering**: Control which agents should have access to which services and API endpoints on them since authenticated requests flow through Agent Vault.
+- **Request Filters**: Optional per-service sidecar hop after match and before credential inject — for policy like rejecting a `git push` to a protected branch without putting that logic in Agent Vault.
 - **Request Logging**: Inspect authenticated traffic to monitor and diagnose agent behavior.
 
 By default, requests not matching any service forward as plain proxy traffic; flip a vault into strict deny mode (`unmatched_host_policy=deny`) to reject them with 403 instead.
@@ -237,6 +238,7 @@ See the [TypeScript SDK README](sdks/sdk-typescript/README.md) for full document
 ```bash
 make build      # Build frontend + Go binary
 make test       # Run tests
+make test-smoke # Opt-in Layout A filter hop (not in make test)
 make web-dev    # Vite dev server with hot reload (port 5173)
 make dev        # Go + Vite dev servers with hot reload
 make docker     # Build Docker image

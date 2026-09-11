@@ -348,3 +348,25 @@ func TestMergeServicesPortPreserved(t *testing.T) {
 		t.Fatal("merged service port aliased the proposal pointer")
 	}
 }
+
+func TestMergeServicesAuthUpdatePreservesFilter(t *testing.T) {
+	existing := []broker.Service{{
+		Name:   "github-push",
+		Host:   "github.com",
+		Auth:   broker.Auth{Type: "bearer", Token: "OLD"},
+		Filter: &broker.Filter{URL: "http://127.0.0.1:12345", AgentID: "ag1"},
+	}}
+	proposed := []Service{{
+		Action: ActionSet,
+		Name:   "github-push",
+		Host:   "github.com",
+		Auth:   mergeBearer("NEW"),
+	}}
+	merged, _ := MergeServices(existing, proposed)
+	if merged[0].Auth.Token != "NEW" {
+		t.Fatalf("expected auth rotated, got %s", merged[0].Auth.Token)
+	}
+	if merged[0].Filter == nil || merged[0].Filter.AgentID != "ag1" {
+		t.Fatalf("expected filter preserved, got %+v", merged[0].Filter)
+	}
+}

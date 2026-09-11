@@ -59,6 +59,9 @@ func MergeServices(existing []broker.Service, proposed []Service) ([]broker.Serv
 				if len(p.Substitutions) == 0 {
 					next.Substitutions = merged[idx].Substitutions
 				}
+				// Filters are an implementation detail: proposals never
+				// set or clear them.
+				next.Filter = merged[idx].Filter
 				merged[idx] = next
 			default:
 				nameIndex[p.Name] = len(merged)

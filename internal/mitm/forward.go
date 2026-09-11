@@ -238,6 +238,19 @@ func (p *Proxy) forwardRequest(
 		return
 	}
 
+	if c := scope.Continuation; c != nil {
+		if !strings.EqualFold(c.Method, r.Method) || !strings.EqualFold(c.Host, host) || c.Path != r.URL.Path {
+			brokercore.WriteProxyError(w, http.StatusForbidden, "filter_ticket_mismatch",
+				"Continuation ticket does not match this request.")
+			emit(http.StatusForbidden, "filter_ticket_mismatch")
+			return
+		}
+	}
+
+	if p.maybeForwardFilter(w, r, target, host, port, useTLSUpstream, scope, emit) {
+		return
+	}
+
 	inject, err := p.creds.Inject(r.Context(), scope.VaultID, host, port, r.URL.Path)
 	if inject != nil {
 		event.MatchedService = inject.MatchedName

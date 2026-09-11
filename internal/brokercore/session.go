@@ -2,6 +2,7 @@ package brokercore
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/Infisical/agent-vault/internal/store"
@@ -26,6 +27,18 @@ type ProxyScope struct {
 	VaultID   string
 	VaultName string
 	VaultRole string
+
+	// SkipFilter is set when this hop must not reverse-proxy to a
+	// sidecar (HMAC continuation ticket, or the minted filter-agent).
+	SkipFilter bool
+	// FilterAgentID is the minted filter-agent this continuation was
+	// issued for. Empty on normal sessions.
+	FilterAgentID string
+	// Continuation is non-nil when auth was an HMAC ticket. MITM checks
+	// that this request's method/host/path match the claims, then
+	// injects inbound-vault credentials. The body is this request's
+	// body (from the sidecar), not a held copy of the first hop.
+	Continuation *ContinuationClaims
 }
 
 // ActorID returns the non-empty principal ID — UserID for user
@@ -58,8 +71,9 @@ type SessionStore interface {
 // StoreSessionResolver resolves sessions through a SessionStore. Now is
 // injectable so tests can control expiry without wall-clock flake.
 type StoreSessionResolver struct {
-	Store SessionStore
-	Now   func() time.Time
+	Store   SessionStore
+	Now     func() time.Time
+	Tickets *TicketSigner // nil = no continuation tickets
 }
 
 // NewStoreSessionResolver constructs a resolver backed by s. If s is nil
@@ -74,6 +88,13 @@ func NewStoreSessionResolver(s SessionStore) *StoreSessionResolver {
 func (r *StoreSessionResolver) ResolveForProxy(ctx context.Context, token, vaultHint string) (*ProxyScope, error) {
 	if token == "" {
 		return nil, ErrInvalidSession
+	}
+	if r.Tickets != nil && strings.HasPrefix(token, ContinuationTokenPrefix) {
+		claims, err := r.Tickets.Parse(token)
+		if err != nil {
+			return nil, err
+		}
+		return claims.Scope(), nil
 	}
 	sess, err := r.Store.GetSession(ctx, token)
 	if err != nil || sess == nil {

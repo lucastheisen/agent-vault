@@ -105,23 +105,23 @@ func NewStoreCredentialProvider(s CredentialStore, encKey []byte) *StoreCredenti
 	return &StoreCredentialProvider{Store: s, EncKey: encKey}
 }
 
-// Inject matches (targetHost, targetPath) and resolves the matched
-// service's auth into HTTP headers. targetHost may include a port —
-// stripped before matching. Pass "/" for targetPath when no path is
-// meaningful.
-func (p *StoreCredentialProvider) Inject(ctx context.Context, vaultID, targetHost string, targetPort int, targetPath string) (*InjectResult, error) {
+// loadMatchedService is the shared match path for Inject (which then
+// resolves credentials) and Match (which does not). targetHost may
+// include a port — stripped before matching. Pass "/" for targetPath
+// when no path is meaningful.
+func (p *StoreCredentialProvider) loadMatchedService(ctx context.Context, vaultID, targetHost string, targetPort int, targetPath string) (*broker.Service, broker.MatchScore, error) {
 	// A missing row is equivalent to an empty services list — fall
 	// through to the unmatched-host policy. Any other error fails closed
 	// so a transient store failure can't silently strip enforcement.
 	cfg, err := p.Store.GetBrokerConfig(ctx, vaultID)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrServiceNotFound
+		return nil, broker.MatchScore{}, ErrServiceNotFound
 	}
 
 	var services []broker.Service
 	if cfg != nil && cfg.ServicesJSON != "" {
 		if err := json.Unmarshal([]byte(cfg.ServicesJSON), &services); err != nil {
-			return nil, fmt.Errorf("brokercore: parsing broker services: %w", err)
+			return nil, broker.MatchScore{}, fmt.Errorf("brokercore: parsing broker services: %w", err)
 		}
 	}
 	// MarshalJSON persists Host in joined-inline form; the matcher
@@ -143,6 +143,26 @@ func (p *StoreCredentialProvider) Inject(ctx context.Context, vaultID, targetHos
 		targetPath = "/"
 	}
 	matched, score := broker.MatchService(matchHost, targetPort, targetPath, services)
+	return matched, score, nil
+}
+
+// Match returns the broker service for (host, port, path) without resolving
+// credentials. nil, nil means no match (caller applies unmatched-host policy
+// via Inject).
+func (p *StoreCredentialProvider) Match(ctx context.Context, vaultID, targetHost string, targetPort int, targetPath string) (*broker.Service, error) {
+	matched, _, err := p.loadMatchedService(ctx, vaultID, targetHost, targetPort, targetPath)
+	return matched, err
+}
+
+// Inject matches (targetHost, targetPath) and resolves the matched
+// service's auth into HTTP headers. targetHost may include a port —
+// stripped before matching. Pass "/" for targetPath when no path is
+// meaningful.
+func (p *StoreCredentialProvider) Inject(ctx context.Context, vaultID, targetHost string, targetPort int, targetPath string) (*InjectResult, error) {
+	matched, score, err := p.loadMatchedService(ctx, vaultID, targetHost, targetPort, targetPath)
+	if err != nil {
+		return nil, err
+	}
 	if matched == nil {
 		// Fail closed on policy lookup errors so a transient store
 		// failure can't silently strip enforcement.

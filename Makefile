@@ -8,7 +8,7 @@ LDFLAGS := -s -w \
 	-X github.com/Infisical/agent-vault/cmd.date=$(DATE) \
 	-X github.com/Infisical/agent-vault/cmd.posthogAPIKey=$(POSTHOG_API_KEY)
 
-.PHONY: build dev test lint coverage test-all clean docker web web-dev sdk-ts sdk-ts-test
+.PHONY: build dev test test-smoke lint coverage test-all clean docker web web-dev sdk-ts sdk-ts-test
 
 web:
 	cd web && npm ci && npm run build
@@ -39,6 +39,10 @@ dev: web
 
 test:
 	go test ./...
+
+# Opt-in: Layout A filter hop (MITM + sidecar + origin). Not in `test`.
+test-smoke:
+	go test -tags smoke -count=1 ./internal/server/ -run '^TestSmoke_' -timeout 60s
 
 lint:
 	golangci-lint run ./...

@@ -35,6 +35,8 @@ type Service struct {
 	Enabled       *bool          `yaml:"enabled,omitempty" json:"enabled,omitempty"`
 	Auth          Auth           `yaml:"auth" json:"auth"`
 	Substitutions []Substitution `yaml:"substitutions,omitempty" json:"substitutions,omitempty"`
+	Filter        *Filter        `yaml:"filter,omitempty" json:"filter,omitempty"`
+	FilterOp      FilterOp       `json:"-" yaml:"-"`
 }
 
 // MatcherPattern returns the joined inline form (`slack.com/api/*`),
@@ -51,12 +53,43 @@ func (s Service) MatcherPattern() string {
 }
 
 func (s Service) MarshalJSON() ([]byte, error) {
-	type alias Service // strip MarshalJSON to avoid recursion
-	a := alias(s)
-	a.Host = s.MatcherPattern()
-	a.Path = ""
-	a.Port = nil
-	return json.Marshal(a)
+	type wire struct {
+		Name          string         `json:"name"`
+		Host          string         `json:"host"`
+		Enabled       *bool          `json:"enabled,omitempty"`
+		Auth          Auth           `json:"auth"`
+		Substitutions []Substitution `json:"substitutions,omitempty"`
+		Filter        *Filter        `json:"filter,omitempty"`
+	}
+	w := wire{
+		Name:          s.Name,
+		Host:          s.MatcherPattern(),
+		Enabled:       s.Enabled,
+		Auth:          s.Auth,
+		Substitutions: s.Substitutions,
+		Filter:        s.Filter,
+	}
+	if s.FilterOp != FilterOpClear {
+		return json.Marshal(w)
+	}
+	// Explicit clear must survive the CLI YAML→JSON→Service→JSON round
+	// trip. encoding/json omitempty drops a nil Filter, and the server
+	// would treat a missing field as omit (preserve).
+	type wireClear struct {
+		Name          string         `json:"name"`
+		Host          string         `json:"host"`
+		Enabled       *bool          `json:"enabled,omitempty"`
+		Auth          Auth           `json:"auth"`
+		Substitutions []Substitution `json:"substitutions,omitempty"`
+		Filter        *Filter        `json:"filter"`
+	}
+	return json.Marshal(wireClear{
+		Name:          w.Name,
+		Host:          w.Host,
+		Enabled:       w.Enabled,
+		Auth:          w.Auth,
+		Substitutions: w.Substitutions,
+	})
 }
 
 // Substitution declares a placeholder string the broker rewrites with a
@@ -377,6 +410,9 @@ func Validate(cfg *Config) error {
 			return fmt.Errorf("service %d: %w", i, err)
 		}
 		if err := s.ValidateSubstitutions(); err != nil {
+			return fmt.Errorf("service %d: %w", i, err)
+		}
+		if err := ValidateFilter(s.Filter); err != nil {
 			return fmt.Errorf("service %d: %w", i, err)
 		}
 	}

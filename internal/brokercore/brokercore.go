@@ -27,6 +27,15 @@ const DefaultMaxResponseBytes int64 = 0
 // responses that happen to share the same status code.
 const ProxyErrorHeader = "X-Agent-Vault-Proxy-Error"
 
+// Hop headers Agent Vault sets on the reverse-proxy to a service filter.
+const (
+	HeaderOriginalURL = "X-Agent-Vault-Original-URL"
+	HeaderFilterToken = "X-Agent-Vault-Filter-Token"
+	HeaderFilterNonce = "X-Agent-Vault-Filter-Nonce"
+	HeaderService     = "X-Agent-Vault-Service"
+	HeaderFilterVault = "X-Agent-Vault-Filter-Vault"
+)
+
 // HopByHopHeaders are HTTP/1.1 hop-by-hop headers that must not be
 // forwarded by a proxy. Includes Proxy-Connection — non-RFC but emitted
 // by some HTTP/1.0 clients and conventionally treated as hop-by-hop.
@@ -73,6 +82,11 @@ func IsValidHost(h string) bool {
 var brokerScopedRequestHeaders = map[string]bool{
 	"X-Vault":             true,
 	"Proxy-Authorization": true,
+	HeaderOriginalURL:     true,
+	HeaderFilterToken:     true,
+	HeaderFilterNonce:     true,
+	HeaderService:         true,
+	HeaderFilterVault:     true,
 }
 
 // IsBrokerScopedRequestHeader reports whether a request header
