@@ -43,6 +43,10 @@ func MergeServices(existing []broker.Service, proposed []Service) ([]broker.Serv
 				warnings = append(warnings, fmt.Sprintf("skipped delete for %q: service not found", p.Name))
 				continue
 			}
+			if merged[idx].Filter != nil {
+				warnings = append(warnings, fmt.Sprintf("skipped delete for %q: policy filter is admin-configured", p.Name))
+				continue
+			}
 			removeSet[idx] = true
 			delete(nameIndex, p.Name)
 
@@ -54,6 +58,9 @@ func MergeServices(existing []broker.Service, proposed []Service) ([]broker.Serv
 				merged[idx].Enabled = p.Enabled
 			case exists:
 				next := toBrokerService(p)
+				// Filters are admin-only. Preserve one already attached to the service so
+				// applying an ordinary agent proposal cannot disable policy.
+				next.Filter = merged[idx].Filter
 				// Empty Substitutions means "leave existing alone";
 				// callers clear by delete+recreate.
 				if len(p.Substitutions) == 0 {

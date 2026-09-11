@@ -217,6 +217,10 @@ func attachMITMIfEnabled(srv *server.Server, host string, mitmPort int, masterKe
 		fmt.Fprintf(os.Stderr, "warning: transparent proxy disabled (CA init failed: %v); pass --mitm-port 0 to suppress\n", err)
 		return nil
 	}
+	filterProxyURL, err := mitm.ParseFilterProxyURL(os.Getenv("AGENT_VAULT_FILTER_PROXY_URL"))
+	if err != nil {
+		return fmt.Errorf("invalid AGENT_VAULT_FILTER_PROXY_URL: %w", err)
+	}
 	srv.AttachMITM(mitm.New(
 		net.JoinHostPort(host, strconv.Itoa(mitmPort)),
 		mitm.Options{
@@ -229,6 +233,8 @@ func attachMITMIfEnabled(srv *server.Server, host string, mitmPort int, masterKe
 			LogSink:          srv.LogSink(),
 			MaxResponseBytes: maxRespBytes,
 			MaxRequestBytes:  maxReqBytes,
+			PolicyVault:      srv.ResolvePolicyVault,
+			FilterProxyURL:   filterProxyURL,
 		},
 	))
 	return nil

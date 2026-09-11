@@ -18,9 +18,11 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/Infisical/agent-vault/internal/broker"
 	"github.com/Infisical/agent-vault/internal/brokercore"
 	"github.com/Infisical/agent-vault/internal/ca"
 	"github.com/Infisical/agent-vault/internal/ratelimit"
@@ -58,32 +60,98 @@ func errResolver(err error) *fakeSessionResolver {
 type fakeCredProvider struct {
 	// byHost maps target host (without port) to the injection outcome.
 	byHost map[string]fakeInjectResult
+	// byVaultHost maps a vault and target host to an injection outcome.
+	// Checked before byHost so policy-vault tests can model separate rules.
+	byVaultHost map[string]fakeInjectResult
 	// byHostPort maps "host:port" to the injection outcome. Checked
 	// before byHost so port-specific entries take precedence.
-	byHostPort map[string]fakeInjectResult
+	byHostPort   map[string]fakeInjectResult
+	mu           sync.Mutex
+	matchCalls   int
+	resolveCalls int
+	resolved     map[*brokercore.CredentialMatch]fakeInjectResult
 }
 
 type fakeInjectResult struct {
+	filter *broker.Filter
 	result *brokercore.InjectResult
 	err    error
 }
 
-func (f *fakeCredProvider) Inject(_ context.Context, _, targetHost string, targetPort int, _ string) (*brokercore.InjectResult, error) {
+func (f *fakeCredProvider) lookup(vaultID, targetHost string, targetPort int) (fakeInjectResult, bool) {
 	host := targetHost
 	if h, _, err := net.SplitHostPort(targetHost); err == nil {
 		host = h
 	}
+	if f.byVaultHost != nil {
+		if res, ok := f.byVaultHost[vaultID+"|"+host]; ok {
+			return res, true
+		}
+	}
 	if f.byHostPort != nil && targetPort > 0 {
 		key := net.JoinHostPort(host, fmt.Sprintf("%d", targetPort))
 		if res, ok := f.byHostPort[key]; ok {
-			return res.result, res.err
+			return res, true
 		}
 	}
 	res, ok := f.byHost[host]
+	return res, ok
+}
+
+func (f *fakeCredProvider) Match(_ context.Context, vaultID, targetHost string, targetPort int, _ string) (*brokercore.CredentialMatch, error) {
+	f.mu.Lock()
+	f.matchCalls++
+	f.mu.Unlock()
+	res, ok := f.lookup(vaultID, targetHost, targetPort)
+	if !ok {
+		return nil, brokercore.ErrServiceNotFound
+	}
+	host := targetHost
+	if h, _, err := net.SplitHostPort(targetHost); err == nil {
+		host = h
+	}
+	match := &brokercore.CredentialMatch{Filter: res.filter, MatchedHost: host}
+	if res.result != nil {
+		match.MatchedName = res.result.MatchedName
+		if res.result.MatchedHost != "" {
+			match.MatchedHost = res.result.MatchedHost
+		}
+		match.MatchedPath = res.result.MatchedPath
+		match.MatchedPort = res.result.MatchedPort
+		match.CredentialKeys = res.result.CredentialKeys
+		match.Passthrough = res.result.Passthrough
+	}
+	f.mu.Lock()
+	if f.resolved == nil {
+		f.resolved = make(map[*brokercore.CredentialMatch]fakeInjectResult)
+	}
+	f.resolved[match] = res
+	f.mu.Unlock()
+	return match, nil
+}
+
+func (f *fakeCredProvider) MatchCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.matchCalls
+}
+
+func (f *fakeCredProvider) Resolve(_ context.Context, _ string, match *brokercore.CredentialMatch) (*brokercore.InjectResult, error) {
+	f.mu.Lock()
+	f.resolveCalls++
+	res, ok := f.resolved[match]
+	delete(f.resolved, match)
+	f.mu.Unlock()
 	if !ok {
 		return nil, brokercore.ErrServiceNotFound
 	}
 	return res.result, res.err
+}
+
+func (f *fakeCredProvider) ResolveCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.resolveCalls
 }
 
 // setupProxy starts a mitm.Proxy backed by a freshly-generated SoftCA and

@@ -134,7 +134,7 @@ func (p *Proxy) handleForward(w http.ResponseWriter, r *http.Request) {
 		writeProxyAuthChallenge(w, "Proxy-Authorization required")
 		return
 	}
-	scope, err := p.sessions.ResolveForProxy(r.Context(), token, hint)
+	scope, err := p.resolveScope(r.Context(), token, hint, target)
 	if err != nil {
 		p.recordAuthFailure(r)
 		writeAuthError(w, err)
@@ -209,14 +209,23 @@ func (p *Proxy) forwardRequest(
 		event.Emit(p.logger, start, status, errCode)
 		p.logSink.Record(r.Context(), requestlog.FromEvent(event, scope.VaultID, actorType, actorID))
 	}
-
-	enf := p.rateLimit.EnforceProxy(r.Context(), scope.ActorID(), scope.VaultID)
-	if !enf.Allowed {
-		ratelimit.WriteDenial(w, enf.Decision, enf.Message)
-		emit(http.StatusTooManyRequests, enf.ErrCode)
+	if scope.FilterPolicy && !scope.FilterPolicyExpiresAt.IsZero() && !time.Now().Before(scope.FilterPolicyExpiresAt) {
+		brokercore.WriteProxyError(w, http.StatusForbidden, "filter_policy_expired", "filter policy session expired")
+		emit(http.StatusForbidden, "filter_policy_expired")
 		return
 	}
-	defer enf.Release()
+
+	release := func() {}
+	if scope.FilterContinuation == "" {
+		enforcement := p.rateLimit.EnforceProxy(r.Context(), scope.ActorID(), scope.VaultID)
+		if !enforcement.Allowed {
+			ratelimit.WriteDenial(w, enforcement.Decision, enforcement.Message)
+			emit(http.StatusTooManyRequests, enforcement.ErrCode)
+			return
+		}
+		release = enforcement.Release
+	}
+	defer release()
 
 	r.Body = http.MaxBytesReader(w, r.Body, p.maxRequestBytes)
 
@@ -238,15 +247,57 @@ func (p *Proxy) forwardRequest(
 		return
 	}
 
-	inject, err := p.creds.Inject(r.Context(), scope.VaultID, host, port, r.URL.Path)
-	if inject != nil {
-		event.MatchedService = inject.MatchedName
-		event.MatchedHost = inject.MatchedHost
-		event.MatchedPath = inject.MatchedPath
-		event.MatchedPort = inject.MatchedPort
-		event.CredentialKeys = inject.CredentialKeys
-		event.Passthrough = inject.Passthrough
+	var match *brokercore.CredentialMatch
+	var err error
+	if scope.FilterContinuation != "" {
+		var allowed bool
+		match, allowed = p.consumeFilterContinuation(scope, filterRequest{
+			method: r.Method,
+			path:   r.URL.EscapedPath(),
+			query:  r.URL.RawQuery,
+			scheme: scheme,
+			target: target,
+		})
+		if !allowed {
+			brokercore.WriteProxyError(w, http.StatusForbidden, "filter_capability_forbidden",
+				"filter continuation is not authorized for this request")
+			emit(http.StatusForbidden, "filter_capability_forbidden")
+			return
+		}
+	} else {
+		match, err = p.creds.Match(r.Context(), scope.VaultID, host, port, r.URL.Path)
 	}
+	if match != nil {
+		event.MatchedService = match.MatchedName
+		event.MatchedHost = match.MatchedHost
+		event.MatchedPath = match.MatchedPath
+		event.MatchedPort = match.MatchedPort
+		event.CredentialKeys = match.CredentialKeys
+		event.Passthrough = match.Passthrough
+	}
+	if err != nil {
+		brokercore.WriteInjectError(w, err, target, scope.VaultName, p.baseURL)
+		emit(http.StatusForbidden, "no_match")
+		return
+	}
+	if scope.FilterPolicy && match.Filter != nil {
+		brokercore.WriteProxyError(w, http.StatusForbidden, "filter_policy_recursion",
+			"filter policy sessions cannot invoke policy filters")
+		emit(http.StatusForbidden, "filter_policy_recursion")
+		return
+	}
+	if match.Filter != nil && scope.FilterContinuation == "" {
+		if isWebSocketUpgrade(r) {
+			http.Error(w, "policy filters do not support websocket upgrades", http.StatusNotImplemented)
+			emit(http.StatusNotImplemented, "filter_websocket_unsupported")
+			return
+		}
+		status, errCode := p.forwardToFilter(w, r, target, scheme, scope, match)
+		emit(status, errCode)
+		return
+	}
+
+	inject, err := p.creds.Resolve(r.Context(), scope.VaultID, match)
 	if err != nil {
 		errCode := "no_match"
 		status := http.StatusForbidden
@@ -297,6 +348,7 @@ func (p *Proxy) forwardRequest(
 	} else {
 		brokercore.ApplyInjection(r.Header, outReq.Header, inject)
 	}
+	stripFilterInternalHeaders(outReq.Header)
 
 	if err := brokercore.ApplySubstitutions(outReq.URL, outReq.Header, inject.Substitutions); err != nil {
 		http.Error(w, "bad gateway", http.StatusBadGateway)
@@ -353,7 +405,7 @@ func (p *Proxy) forwardRequest(
 	if resp.StatusCode == http.StatusUnauthorized && inject != nil && !inject.Passthrough &&
 		(r.Method == http.MethodGet || r.Method == http.MethodHead) {
 		_ = resp.Body.Close()
-		retryInject, retryErr := p.creds.Inject(r.Context(), scope.VaultID, host, port, r.URL.Path)
+		retryInject, retryErr := p.creds.Resolve(r.Context(), scope.VaultID, match)
 		if retryErr == nil && retryInject != nil && retryInject.Headers != nil {
 			retryReq := outReq.Clone(outReq.Context())
 			for k, v := range retryInject.Headers {
@@ -390,7 +442,7 @@ func (p *Proxy) forwardRequest(
 	}
 
 	for k, vv := range resp.Header {
-		if brokercore.ShouldStripResponseHeader(k) {
+		if brokercore.ShouldStripResponseHeader(k) || isFilterInternalHeader(k) {
 			continue
 		}
 		for _, v := range vv {

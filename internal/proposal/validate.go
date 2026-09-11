@@ -19,7 +19,6 @@ const (
 	MaxObtainInstructionsLen = 1000
 )
 
-
 // ValidateMessages checks length limits for proposal-level message fields.
 func ValidateMessages(message, userMessage string) error {
 	if len(message) > MaxMessageLen {
@@ -47,6 +46,9 @@ func Validate(services []Service, credentials []CredentialSlot) error {
 	for i, s := range services {
 		if s.Action != ActionSet && s.Action != ActionDelete {
 			return fmt.Errorf("service %d: invalid action %q (must be %q or %q)", i, s.Action, ActionSet, ActionDelete)
+		}
+		if s.Filter != nil {
+			return fmt.Errorf("service %d: filter is admin-configured and cannot be proposed", i)
 		}
 		if s.Host == "" {
 			return fmt.Errorf("service %d: host is required", i)

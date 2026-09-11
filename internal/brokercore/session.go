@@ -26,6 +26,19 @@ type ProxyScope struct {
 	VaultID   string
 	VaultName string
 	VaultRole string
+
+	// FilterPolicy marks a short-lived session issued to a policy filter. It
+	// may use ordinary services in its policy vault but cannot invoke another
+	// filter, preventing recursive filter chains.
+	FilterPolicy bool
+	// FilterPolicyExpiresAt keeps the short lifetime enforceable for every
+	// request on a persistent CONNECT tunnel, not only at tunnel creation.
+	FilterPolicyExpiresAt time.Time
+
+	// FilterContinuation is set only on the private scope created for a
+	// policy-filter continuation. The proxy validates and consumes it against
+	// the exact original request before resolving a destination credential.
+	FilterContinuation string
 }
 
 // ActorID returns the non-empty principal ID — UserID for user

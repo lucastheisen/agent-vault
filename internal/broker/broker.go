@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"regexp"
 	"strconv"
@@ -34,7 +35,17 @@ type Service struct {
 	Port          *int           `yaml:"port,omitempty" json:"-"`
 	Enabled       *bool          `yaml:"enabled,omitempty" json:"enabled,omitempty"`
 	Auth          Auth           `yaml:"auth" json:"auth"`
+	Filter        *Filter        `yaml:"filter,omitempty" json:"filter,omitempty"`
 	Substitutions []Substitution `yaml:"substitutions,omitempty" json:"substitutions,omitempty"`
+}
+
+// Filter delegates a matching request to a trusted policy service
+// before Agent Vault injects the service credential. PolicyVault, when set,
+// supplies that service with a short-lived proxy capability scoped to a
+// separate vault.
+type Filter struct {
+	PolicyVault string `yaml:"policy_vault,omitempty" json:"policy_vault,omitempty"`
+	URL         string `yaml:"url" json:"url"`
 }
 
 // MatcherPattern returns the joined inline form (`slack.com/api/*`),
@@ -376,8 +387,47 @@ func Validate(cfg *Config) error {
 		if err := s.Auth.Validate(); err != nil {
 			return fmt.Errorf("service %d: %w", i, err)
 		}
+		if err := s.Filter.Validate(); err != nil {
+			return fmt.Errorf("service %d: %w", i, err)
+		}
 		if err := s.ValidateSubstitutions(); err != nil {
 			return fmt.Errorf("service %d: %w", i, err)
+		}
+	}
+	return nil
+}
+
+// Validate checks that remote filters use HTTPS while allowing plain HTTP for
+// a same-host loopback service.
+func (f *Filter) Validate() error {
+	if f == nil {
+		return nil
+	}
+	if f.URL == "" {
+		return fmt.Errorf("filter: url is required")
+	}
+	u, err := url.Parse(f.URL)
+	if err != nil {
+		return fmt.Errorf("filter: parse url: %w", err)
+	}
+	if !u.IsAbs() || (u.Scheme != "http" && u.Scheme != "https") {
+		return fmt.Errorf("filter: url scheme must be http or https")
+	}
+	if u.User != nil || u.Hostname() == "" {
+		return fmt.Errorf("filter: url must contain a host without userinfo")
+	}
+	if u.Fragment != "" {
+		return fmt.Errorf("filter: url must not contain a fragment")
+	}
+	if u.Scheme == "http" {
+		ip := net.ParseIP(u.Hostname())
+		if ip == nil || !ip.IsLoopback() {
+			return fmt.Errorf("filter: http url host must be a loopback IP address")
+		}
+	}
+	if f.PolicyVault != "" {
+		if err := ValidateSlug(f.PolicyVault); err != nil {
+			return fmt.Errorf("filter: policy_vault: %w", err)
 		}
 	}
 	return nil

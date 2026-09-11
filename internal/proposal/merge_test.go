@@ -1,6 +1,7 @@
 package proposal
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/Infisical/agent-vault/internal/broker"
@@ -187,6 +188,47 @@ func TestMergeServicesCopiesSubstitutions(t *testing.T) {
 	proposed[0].Substitutions[0].Placeholder = "__mutated__"
 	if merged[0].Substitutions[0].Placeholder != "__account_sid__" {
 		t.Fatal("merged service substitution aliased the proposal slice")
+	}
+}
+
+func TestMergeServicesPreservesAdminConfiguredFilter(t *testing.T) {
+	existing := []broker.Service{{
+		Name: "gitlab-push",
+		Host: "gitlab.example.com",
+		Auth: broker.Auth{Type: "bearer", Token: "OLD_TOKEN"},
+		Filter: &broker.Filter{
+			URL:         "https://policy.example.com/git-push",
+			PolicyVault: "push-policy",
+		},
+	}}
+	proposed := []Service{{
+		Action: ActionSet,
+		Name:   "gitlab-push",
+		Host:   "gitlab.example.com",
+		Auth:   &broker.Auth{Type: "bearer", Token: "NEW_TOKEN"},
+	}}
+
+	merged, _ := MergeServices(existing, proposed)
+	if merged[0].Filter == nil || merged[0].Filter.PolicyVault != "push-policy" {
+		t.Fatalf("admin-configured filter was removed: %+v", merged[0].Filter)
+	}
+}
+
+func TestMergeServicesCannotDeleteAdminConfiguredFilter(t *testing.T) {
+	existing := []broker.Service{{
+		Name:   "gitlab-push",
+		Host:   "gitlab.example.com",
+		Auth:   broker.Auth{Type: "bearer", Token: "TOKEN"},
+		Filter: &broker.Filter{URL: "https://policy.example.com/git-push"},
+	}}
+	proposed := []Service{{Action: ActionDelete, Name: "gitlab-push", Host: "gitlab.example.com"}}
+
+	merged, warnings := MergeServices(existing, proposed)
+	if len(merged) != 1 || merged[0].Filter == nil {
+		t.Fatalf("admin-configured filter was deleted: %+v", merged)
+	}
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "admin-configured") {
+		t.Fatalf("warnings = %q, want admin-configured warning", warnings)
 	}
 }
 

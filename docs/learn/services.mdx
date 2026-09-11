@@ -169,6 +169,77 @@ This means vendor headers like `anthropic-version`, `OpenAI-Beta`, `If-Match`, a
   credentials.
 </Warning>
 
+## Policy filters
+
+A vault admin can require a matching request to pass through an HTTP policy
+service before Agent Vault resolves the destination credential.
+The filter can return a response immediately, such as `403 Forbidden`, or send
+the request back through Agent Vault to continue to the configured upstream.
+
+```yaml
+services:
+  - name: gitlab-push
+    host: gitlab.example.com/group/project.git/git-receive-pack
+    auth:
+      type: basic
+      username: GITLAB_USERNAME
+      password: GITLAB_PUSH_TOKEN
+    filter:
+      url: https://policy.example.com/gitlab-push
+      policy_vault: gitlab-push-policy
+```
+
+`policy_vault` is optional.
+When present, the caller configuring the service must be an admin of both the
+service vault and the separate policy vault.
+The filter receives a short-lived proxy capability for that policy vault, so
+its own API lookups can use credentials and services that the agent cannot use.
+Use a dedicated policy vault containing only the services and credentials the
+filter needs.
+Policy-vault services cannot themselves invoke another policy filter.
+Filters are intentionally admin-configured and are not accepted through agent
+proposals because they delegate cross-vault authority.
+
+Agent Vault sends the original method, headers, and streaming body to the
+filter URL without resolving the destination credential.
+It adds these internal headers:
+
+- `X-Agent-Vault-Target-URL`: The exact original destination URL.
+- `X-Agent-Vault-Continuation-Proxy`: A proxy URL containing a 30-second,
+  single-use capability for the exact method and destination URL.
+- `X-Agent-Vault-Policy-Proxy`: A reusable 30-second proxy URL scoped to
+  `policy_vault`; omitted when no policy vault is configured.
+- `X-Agent-Vault-CA`: The Agent Vault MITM root certificate as base64-encoded
+  PEM, for a client that continues an HTTPS request.
+
+To allow a request, the filter sends it to `X-Agent-Vault-Target-URL` through
+`X-Agent-Vault-Continuation-Proxy` and returns that response.
+The filter may change headers or the body, but changing the method or target
+causes Agent Vault to reject the continuation.
+The continuation is single-use even when the filter keeps a CONNECT tunnel
+open.
+Agent Vault strips all `X-Agent-Vault-*` headers before a request reaches the
+destination and before a response reaches the agent.
+Treat the continuation and policy proxy URLs as short-lived bearer secrets and
+do not log them.
+The proxy URLs contain bearer capabilities: filters must not persist or log
+them.
+
+Request bodies are streamed rather than duplicated in Agent Vault.
+A filter that consumes a body before continuing is responsible for buffering
+or spooling and replaying it within the configured request-size limit.
+WebSocket upgrades are not supported on filtered services.
+
+Plain HTTP filter URLs must use a literal loopback address.
+Remote filters must use HTTPS and a certificate trusted by the Agent Vault
+host.
+Use a dedicated policy vault containing only the services and credentials the
+filter needs for its decision.
+Set `AGENT_VAULT_FILTER_PROXY_URL` to the HTTPS forward-proxy address that the
+remote filter can reach.
+Agent Vault's native proxy listener is HTTP, so deployments normally put a TLS
+terminator in front of that listener for this return path.
+
 ## Substitutions
 
 Auth types only inject HTTP headers. Some APIs want a credential value elsewhere — in the URL path, query string, request body, or even inside a WebSocket message. For those, declare a `substitutions` block alongside the auth.

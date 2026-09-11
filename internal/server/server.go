@@ -59,18 +59,18 @@ type agentVaultJSON struct {
 
 // Server is the Agent Vault HTTP server.
 type Server struct {
-	httpServer  *http.Server
-	store       Store
-	encKey      []byte // 32-byte encryption key, held in memory while running
-	notifier    *notify.Notifier
-	initialized    bool                // true when at least one owner account exists
-	lastInitCheck  atomic.Int64        // unix-millis of last DB check for initialization (throttle)
-	baseURL     string              // externally-reachable base URL (e.g. "https://sb.example.com")
-	skillCLI    []byte              // embedded CLI skill content (served at GET /v1/skills/cli)
-	mitm        *mitm.Proxy         // transparent MITM proxy; nil only when --mitm-port 0
-	logger      *slog.Logger        // structured logger for per-request observability
-	rateLimit   *ratelimit.Registry // tiered rate limiter; shared with the MITM ingress
-	logSink     requestlog.Sink     // per-request persistence sink; never nil (Nop default)
+	httpServer    *http.Server
+	store         Store
+	encKey        []byte // 32-byte encryption key, held in memory while running
+	notifier      *notify.Notifier
+	initialized   bool                // true when at least one owner account exists
+	lastInitCheck atomic.Int64        // unix-millis of last DB check for initialization (throttle)
+	baseURL       string              // externally-reachable base URL (e.g. "https://sb.example.com")
+	skillCLI      []byte              // embedded CLI skill content (served at GET /v1/skills/cli)
+	mitm          *mitm.Proxy         // transparent MITM proxy; nil only when --mitm-port 0
+	logger        *slog.Logger        // structured logger for per-request observability
+	rateLimit     *ratelimit.Registry // tiered rate limiter; shared with the MITM ingress
+	logSink       requestlog.Sink     // per-request persistence sink; never nil (Nop default)
 	// touchCache short-circuits per-request session-touch writes. With
 	// db.SetMaxOpenConns(1), every UPDATE — even a no-op — opens the
 	// single WAL writer slot. Caching the last-touch wall-clock per
@@ -177,6 +177,27 @@ func (s *Server) captureEvent(r *http.Request, event string, actor *Actor, extra
 // server's store.
 func (s *Server) SessionResolver() brokercore.SessionResolver {
 	return brokercore.NewStoreSessionResolver(s.store)
+}
+
+// ResolvePolicyVault returns the vault scope attached to a short-lived policy
+// capability for a trusted filter. The filter receives only the opaque
+// proxy capability; this method never resolves a credential value.
+func (s *Server) ResolvePolicyVault(ctx context.Context, name string, source *brokercore.ProxyScope) (*brokercore.ProxyScope, error) {
+	if source == nil {
+		return nil, fmt.Errorf("resolve policy vault %q: source scope is required", name)
+	}
+	vault, err := s.store.GetVault(ctx, name)
+	if err != nil || vault == nil {
+		return nil, fmt.Errorf("resolve policy vault %q: not found", name)
+	}
+	return &brokercore.ProxyScope{
+		AgentID:      source.AgentID,
+		UserID:       source.UserID,
+		VaultID:      vault.ID,
+		VaultName:    vault.Name,
+		VaultRole:    "proxy",
+		FilterPolicy: true,
+	}, nil
 }
 
 // CredentialProvider returns a brokercore.CredentialProvider backed by

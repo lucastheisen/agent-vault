@@ -49,6 +49,7 @@ type Service struct {
 	Port          *int                  `json:"-"`
 	Enabled       *bool                 `json:"enabled,omitempty"`
 	Auth          *broker.Auth          `json:"auth,omitempty"`
+	Filter        *broker.Filter        `json:"filter,omitempty"`
 	Substitutions []broker.Substitution `json:"substitutions,omitempty"`
 }
 

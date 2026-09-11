@@ -50,6 +50,20 @@ func TestValidateMissingAuthForSet(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsAdminConfiguredFilter(t *testing.T) {
+	services := []Service{{
+		Action: ActionSet,
+		Name:   "gitlab-push",
+		Host:   "gitlab.example.com",
+		Auth:   &broker.Auth{Type: "passthrough"},
+		Filter: &broker.Filter{URL: "https://policy.example.com/git-push"},
+	}}
+	err := Validate(services, nil)
+	if err == nil || !strings.Contains(err.Error(), "admin-configured") {
+		t.Fatalf("expected admin-configured filter error, got %v", err)
+	}
+}
+
 func TestValidateEnabledOnlySetValid(t *testing.T) {
 	disabled := false
 	services := []Service{{Action: ActionSet, Name: "example-com", Host: "example.com", Enabled: &disabled}}
@@ -317,7 +331,7 @@ func TestValidateProposalSubstitutionWithoutAuth(t *testing.T) {
 	on := true
 	services := []Service{{
 		Action:  ActionSet,
-		Name:   "api-twilio-com",
+		Name:    "api-twilio-com",
 		Host:    "api.twilio.com",
 		Enabled: &on,
 		Substitutions: []broker.Substitution{

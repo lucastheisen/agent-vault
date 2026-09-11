@@ -391,9 +391,9 @@ func (m *mockStore) ExpirePendingProposals(_ context.Context, before time.Time) 
 	return 0, nil
 }
 
-func (m *mockStore) Close() error                                     { return nil }
-func (m *mockStore) Ping(_ context.Context) error                      { return nil }
-func (m *mockStore) DialectName() string                               { return "sqlite" }
+func (m *mockStore) Close() error                                         { return nil }
+func (m *mockStore) Ping(_ context.Context) error                         { return nil }
+func (m *mockStore) DialectName() string                                  { return "sqlite" }
 func (m *mockStore) GetCAState(_ context.Context) (*store.CAState, error) { return nil, nil }
 func (m *mockStore) SetCAState(_ context.Context, _ *store.CAState) error { return nil }
 
@@ -5969,6 +5969,44 @@ func TestServicesUpsertAddNew(t *testing.T) {
 	if resp["services_count"].(float64) != 1 {
 		t.Fatalf("expected services_count=1, got %v", resp["services_count"])
 	}
+}
+
+func TestServicesUpsertFilterRequiresPolicyVaultAdmin(t *testing.T) {
+	tester := func(t *testing.T, policyVaultExists, policyVaultAdmin bool, wantStatus int) {
+		t.Helper()
+		ms, token := setupMockStoreWithSession(t)
+		if policyVaultExists {
+			ms.vaults["push-policy"] = &store.Vault{ID: "push-policy-id", Name: "push-policy"}
+		}
+		if policyVaultAdmin {
+			ms.GrantVaultRole(context.Background(), "owner-user-id", "user", "push-policy-id", "admin")
+		}
+		srv := newTestServer(withStore(ms))
+
+		body := `{"services":[{"name":"gitlab-push","host":"gitlab.example.com","auth":{"type":"passthrough"},"filter":{"url":"https://policy.example.com/git-push","policy_vault":"push-policy"}}]}`
+		req := httptest.NewRequest(http.MethodPost, "/v1/vaults/default/services", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+		srv.httpServer.Handler.ServeHTTP(rec, req)
+
+		if rec.Code != wantStatus {
+			t.Fatalf("status = %d, want %d: %s", rec.Code, wantStatus, rec.Body.String())
+		}
+		_, stored := ms.brokerConfigs["root-ns-id"]
+		if (wantStatus == http.StatusOK) != stored {
+			t.Fatalf("broker config stored = %v for status %d", stored, wantStatus)
+		}
+	}
+
+	t.Run("rejects a missing policy vault", func(t *testing.T) {
+		tester(t, false, false, http.StatusBadRequest)
+	})
+	t.Run("rejects a policy vault without admin access", func(t *testing.T) {
+		tester(t, true, false, http.StatusForbidden)
+	})
+	t.Run("accepts when caller administers both vaults", func(t *testing.T) {
+		tester(t, true, true, http.StatusOK)
+	})
 }
 
 // TestServicesUpsertRejectsMissingNameForNewService pins the

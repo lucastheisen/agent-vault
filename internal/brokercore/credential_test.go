@@ -108,6 +108,62 @@ func TestInject_BearerHappyPath(t *testing.T) {
 	}
 }
 
+func TestMatchDoesNotResolveCredentials(t *testing.T) {
+	key32 := make32(0x12)
+	store := newFakeCredStore()
+	store.setServices(t, "v1", []broker.Service{{
+		Name:   "filtered-api",
+		Host:   "api.example.com",
+		Auth:   broker.Auth{Type: "bearer", Token: "MY_TOKEN"},
+		Filter: &broker.Filter{URL: "https://policy.example.com/check"},
+	}})
+	store.setCred(t, key32, "v1", "MY_TOKEN", "s3cret")
+
+	provider := NewStoreCredentialProvider(store, key32)
+	match, err := provider.Match(context.Background(), "v1", "api.example.com", 443, "/")
+	if err != nil {
+		t.Fatalf("Match() unexpected error: %v", err)
+	}
+	if match.Filter == nil || match.MatchedName != "filtered-api" {
+		t.Fatalf("Match() = %+v, want filtered-api metadata", match)
+	}
+	if store.getCredentialCalls != 0 {
+		t.Fatalf("Match() read %d credentials, want 0", store.getCredentialCalls)
+	}
+
+	result, err := provider.Resolve(context.Background(), "v1", match)
+	if err != nil {
+		t.Fatalf("Resolve() unexpected error: %v", err)
+	}
+	if result.Headers["Authorization"] != "Bearer s3cret" || store.getCredentialCalls != 1 {
+		t.Fatalf("Resolve() headers/calls = %q/%d", result.Headers["Authorization"], store.getCredentialCalls)
+	}
+}
+
+func TestResolveRejectsMatchFromAnotherVault(t *testing.T) {
+	key32 := make32(0x13)
+	store := newFakeCredStore()
+	store.setServices(t, "source-vault", []broker.Service{{
+		Name: "api",
+		Host: "api.example.com",
+		Auth: broker.Auth{Type: "bearer", Token: "TOKEN"},
+	}})
+	store.setCred(t, key32, "source-vault", "TOKEN", "source-secret")
+	store.setCred(t, key32, "other-vault", "TOKEN", "other-secret")
+
+	provider := NewStoreCredentialProvider(store, key32)
+	match, err := provider.Match(context.Background(), "source-vault", "api.example.com", 443, "/")
+	if err != nil {
+		t.Fatalf("Match() unexpected error: %v", err)
+	}
+	if _, err := provider.Resolve(context.Background(), "other-vault", match); !errors.Is(err, ErrServiceNotFound) {
+		t.Fatalf("Resolve() error = %v, want ErrServiceNotFound", err)
+	}
+	if store.getCredentialCalls != 0 {
+		t.Fatalf("Resolve() read %d credentials after vault mismatch, want 0", store.getCredentialCalls)
+	}
+}
+
 func TestInject_BasicHappyPath(t *testing.T) {
 	key32 := make32(0x22)
 	f := newFakeCredStore()

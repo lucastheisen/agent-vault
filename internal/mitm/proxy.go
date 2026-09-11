@@ -28,10 +28,12 @@ package mitm
 
 import (
 	"context"
-	"log/slog"
 	"crypto/tls"
+	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -45,18 +47,24 @@ import (
 // Proxy is a transparent MITM proxy. It is safe to start at most once;
 // reuse across Shutdown is not supported.
 type Proxy struct {
-	ca               ca.Provider
-	sessions         brokercore.SessionResolver
-	creds            brokercore.CredentialProvider
-	httpServer       *http.Server
-	upstream         *http.Transport
-	isListening      atomic.Bool
-	baseURL          string // externally-reachable control-plane URL for help links
-	logger           *slog.Logger
-	rateLimit        *ratelimit.Registry // shared with the HTTP server; nil = no-op
-	logSink          requestlog.Sink     // never nil (Nop default); shared with the HTTP server
-	maxResponseBytes int64               // 0 = unlimited
-	maxRequestBytes  int64
+	ca                       ca.Provider
+	sessions                 brokercore.SessionResolver
+	creds                    brokercore.CredentialProvider
+	httpServer               *http.Server
+	upstream                 *http.Transport
+	filterUpstream           *http.Transport
+	filterCaps               *filterCapabilities
+	policyVault              PolicyVaultResolver
+	advertisedFilterProxyURL *url.URL
+	listenerMu               sync.RWMutex
+	listenerAddr             string
+	isListening              atomic.Bool
+	baseURL                  string // externally-reachable control-plane URL for help links
+	logger                   *slog.Logger
+	rateLimit                *ratelimit.Registry // shared with the HTTP server; nil = no-op
+	logSink                  requestlog.Sink     // never nil (Nop default); shared with the HTTP server
+	maxResponseBytes         int64               // 0 = unlimited
+	maxRequestBytes          int64
 }
 
 // Options carries the dependencies a Proxy needs. BaseURL is the
@@ -75,6 +83,13 @@ type Options struct {
 	LogSink          requestlog.Sink // nil → Nop
 	MaxResponseBytes int64           // 0 = unlimited (default); >0 = cap in bytes
 	MaxRequestBytes  int64           // 0 → DefaultMaxRequestBytes (1 GiB)
+	// PolicyVault resolves the vault whose credentials a filter may use
+	// for its own policy checks. Nil disables policy-vault capabilities.
+	PolicyVault PolicyVaultResolver
+	// FilterProxyURL is the externally reachable forward-proxy URL supplied
+	// to filters. Nil advertises this listener on 127.0.0.1, which is suitable
+	// only for a filter running on the same host.
+	FilterProxyURL *url.URL
 }
 
 // New builds a Proxy bound to addr. The returned Proxy does not begin
@@ -82,6 +97,28 @@ type Options struct {
 func New(addr string, opts Options) *Proxy {
 	upstream := &http.Transport{
 		DialContext:           netguard.SafeDialContext(netguard.AllowPrivateFromEnv()),
+		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
+		ForceAttemptHTTP2:     false,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 5 * time.Minute,
+	}
+	safeFilterDial := netguard.SafeDialContext(netguard.AllowPrivateFromEnv())
+	directDial := (&net.Dialer{}).DialContext
+	filterUpstream := &http.Transport{
+		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			host, _, err := net.SplitHostPort(address)
+			if err == nil {
+				if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+					// A literal loopback filter is an explicit admin choice and is
+					// safe from DNS rebinding. Other private destinations retain
+					// the normal netguard policy.
+					return directDial(ctx, network, address)
+				}
+			}
+			return safeFilterDial(ctx, network, address)
+		},
 		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
 		ForceAttemptHTTP2:     false,
 		MaxIdleConns:          100,
@@ -101,18 +138,21 @@ func New(addr string, opts Options) *Proxy {
 	}
 
 	p := &Proxy{
-		ca:               opts.CA,
-		sessions:         opts.Sessions,
-		creds:            opts.Credentials,
-		upstream:         upstream,
-		baseURL:          opts.BaseURL,
-		logger:           opts.Logger,
-		rateLimit:        opts.RateLimit,
-		logSink:          sink,
-		maxResponseBytes: opts.MaxResponseBytes, // 0 = unlimited
-		maxRequestBytes:  maxReq,
+		ca:                       opts.CA,
+		sessions:                 opts.Sessions,
+		creds:                    opts.Credentials,
+		upstream:                 upstream,
+		filterUpstream:           filterUpstream,
+		filterCaps:               newFilterCapabilities(),
+		policyVault:              opts.PolicyVault,
+		advertisedFilterProxyURL: opts.FilterProxyURL,
+		baseURL:                  opts.BaseURL,
+		logger:                   opts.Logger,
+		rateLimit:                opts.RateLimit,
+		logSink:                  sink,
+		maxResponseBytes:         opts.MaxResponseBytes, // 0 = unlimited
+		maxRequestBytes:          maxReq,
 	}
-
 	p.httpServer = &http.Server{
 		Addr:              addr,
 		Handler:           http.HandlerFunc(p.dispatch),
@@ -157,6 +197,9 @@ func (p *Proxy) ListenAndServe() error {
 func (p *Proxy) Serve(l net.Listener) error {
 	p.isListening.Store(true)
 	defer p.isListening.Store(false)
+	p.listenerMu.Lock()
+	p.listenerAddr = l.Addr().String()
+	p.listenerMu.Unlock()
 	return p.httpServer.Serve(l)
 }
 
@@ -166,6 +209,7 @@ func (p *Proxy) Serve(l net.Listener) error {
 // Shutdown returns; the tunnels will die with it.
 func (p *Proxy) Shutdown(ctx context.Context) error {
 	p.upstream.CloseIdleConnections()
+	p.filterUpstream.CloseIdleConnections()
 	return p.httpServer.Shutdown(ctx)
 }
 

@@ -633,6 +633,41 @@ func TestValidateConfigInvalidAuth(t *testing.T) {
 	}
 }
 
+func TestFilterValidate(t *testing.T) {
+	tester := func(t *testing.T, filter *Filter, wantErr string) {
+		t.Helper()
+		err := filter.Validate()
+		if wantErr == "" {
+			if err != nil {
+				t.Fatalf("Validate() unexpected error: %v", err)
+			}
+			return
+		}
+		if err == nil || !strings.Contains(err.Error(), wantErr) {
+			t.Fatalf("Validate() error = %v, want error containing %q", err, wantErr)
+		}
+	}
+
+	t.Run("allows an HTTPS filter", func(t *testing.T) {
+		tester(t, &Filter{URL: "https://policy.example.com/git-push", PolicyVault: "push-policy"}, "")
+	})
+	t.Run("allows loopback HTTP", func(t *testing.T) {
+		tester(t, &Filter{URL: "http://127.0.0.1:23875/git-push"}, "")
+	})
+	t.Run("rejects remote HTTP", func(t *testing.T) {
+		tester(t, &Filter{URL: "http://policy.example.com/git-push"}, "loopback")
+	})
+	t.Run("rejects URL credentials", func(t *testing.T) {
+		tester(t, &Filter{URL: "https://user:secret@policy.example.com/git-push"}, "without userinfo")
+	})
+	t.Run("rejects fragments", func(t *testing.T) {
+		tester(t, &Filter{URL: "https://policy.example.com/git-push#fragment"}, "fragment")
+	})
+	t.Run("rejects invalid policy vault names", func(t *testing.T) {
+		tester(t, &Filter{URL: "https://policy.example.com/git-push", PolicyVault: "Not A Slug"}, "policy_vault")
+	})
+}
+
 func TestValidateConfigRejectsMissingName(t *testing.T) {
 	cfg := &Config{
 		Vault: "default",

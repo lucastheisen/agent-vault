@@ -43,6 +43,33 @@ func splitInlineHosts(in []broker.Service) []broker.Service {
 	return out
 }
 
+// requireFilterPolicyVaultAdmins verifies the cross-vault delegation created
+// by each filter. Admin rights on the source vault alone must never be enough
+// to turn another vault into a credential oracle.
+func (s *Server) requireFilterPolicyVaultAdmins(w http.ResponseWriter, r *http.Request, sourceVaultID string, services []broker.Service) error {
+	checked := make(map[string]bool)
+	for _, service := range services {
+		if service.Filter == nil || service.Filter.PolicyVault == "" || checked[service.Filter.PolicyVault] {
+			continue
+		}
+		checked[service.Filter.PolicyVault] = true
+
+		policyVault, err := s.store.GetVault(r.Context(), service.Filter.PolicyVault)
+		if err != nil || policyVault == nil {
+			jsonError(w, http.StatusBadRequest, fmt.Sprintf("Filter policy vault %q not found", service.Filter.PolicyVault))
+			return fmt.Errorf("filter policy vault %q not found", service.Filter.PolicyVault)
+		}
+		if policyVault.ID == sourceVaultID {
+			jsonError(w, http.StatusBadRequest, "Filter policy vault must be separate from the source vault")
+			return fmt.Errorf("filter policy vault matches source vault")
+		}
+		if _, err := s.requireVaultAdmin(w, r, policyVault.ID); err != nil {
+			return fmt.Errorf("filter policy vault %q requires admin access: %w", service.Filter.PolicyVault, err)
+		}
+	}
+	return nil
+}
+
 // hostAmbiguityError is returned when an unnamed ActionDelete targets a
 // host with multiple registered services. Carries the candidate list.
 type hostAmbiguityError struct {
@@ -404,6 +431,9 @@ func (s *Server) handleServicesUpsert(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, fmt.Sprintf("Invalid services: %v", err))
 		return
 	}
+	if err := s.requireFilterPolicyVaultAdmins(w, r, ns.ID, incomingSlice); err != nil {
+		return
+	}
 
 	// Index existing by canonical Name for upsert.
 	byName := make(map[string]int, len(existing))
@@ -640,6 +670,9 @@ func (s *Server) handleServicesSet(w http.ResponseWriter, r *http.Request) {
 	cfg := broker.Config{Vault: name, Services: services}
 	if err := broker.Validate(&cfg); err != nil {
 		jsonError(w, http.StatusBadRequest, fmt.Sprintf("Invalid services: %v", err))
+		return
+	}
+	if err := s.requireFilterPolicyVaultAdmins(w, r, ns.ID, services); err != nil {
 		return
 	}
 

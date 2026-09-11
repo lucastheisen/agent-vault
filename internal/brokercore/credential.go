@@ -30,8 +30,27 @@ func IsValidUnmatchedHostPolicy(p UnmatchedHostPolicy) bool {
 	return p == PolicyPassthrough || p == PolicyDeny
 }
 
-// InjectResult is the outcome of matching (host, path) and resolving
-// credentials to ready-to-attach HTTP headers.
+// CredentialMatch is the non-secret result of matching a request to a
+// configured service. Resolve must be called before any credential material is
+// available. Keeping matching separate lets policy filters inspect a request
+// before Agent Vault reads or decrypts the destination credential.
+type CredentialMatch struct {
+	Filter *broker.Filter
+
+	MatchedName string
+	MatchedHost string
+	MatchedPath string
+	MatchedPort *int
+
+	CredentialKeys []string
+	Passthrough    bool
+
+	service *broker.Service
+	vaultID string
+}
+
+// InjectResult is the outcome of resolving a CredentialMatch to ready-to-attach
+// HTTP headers.
 type InjectResult struct {
 	// Headers carries SECRET values — never log. Caller must Set (not
 	// Add) so injected values win over client-supplied duplicates.
@@ -59,11 +78,11 @@ type InjectResult struct {
 	Passthrough bool
 }
 
-// CredentialProvider resolves a service for (targetHost, targetPath) in
-// vaultID and returns the headers to attach. targetPath must be the URL
-// path only — no query, no fragment.
+// CredentialProvider separates non-secret service matching from credential
+// resolution. targetPath must be the URL path only — no query or fragment.
 type CredentialProvider interface {
-	Inject(ctx context.Context, vaultID, targetHost string, targetPort int, targetPath string) (*InjectResult, error)
+	Match(ctx context.Context, vaultID, targetHost string, targetPort int, targetPath string) (*CredentialMatch, error)
+	Resolve(ctx context.Context, vaultID string, match *CredentialMatch) (*InjectResult, error)
 }
 
 // CredentialStore is the minimal store surface used by StoreCredentialProvider.
@@ -105,11 +124,19 @@ func NewStoreCredentialProvider(s CredentialStore, encKey []byte) *StoreCredenti
 	return &StoreCredentialProvider{Store: s, EncKey: encKey}
 }
 
-// Inject matches (targetHost, targetPath) and resolves the matched
-// service's auth into HTTP headers. targetHost may include a port —
-// stripped before matching. Pass "/" for targetPath when no path is
-// meaningful.
+// Inject is retained as a convenience for non-proxy callers and tests. The
+// proxy uses Match and Resolve separately so filters run before resolution.
 func (p *StoreCredentialProvider) Inject(ctx context.Context, vaultID, targetHost string, targetPort int, targetPath string) (*InjectResult, error) {
+	match, err := p.Match(ctx, vaultID, targetHost, targetPort, targetPath)
+	if err != nil {
+		return nil, err
+	}
+	return p.Resolve(ctx, vaultID, match)
+}
+
+// Match finds the configured service without reading or decrypting any
+// credential. targetHost may include a port and targetPath defaults to "/".
+func (p *StoreCredentialProvider) Match(ctx context.Context, vaultID, targetHost string, targetPort int, targetPath string) (*CredentialMatch, error) {
 	// A missing row is equivalent to an empty services list — fall
 	// through to the unmatched-host policy. Any other error fails closed
 	// so a transient store failure can't silently strip enforcement.
@@ -150,7 +177,7 @@ func (p *StoreCredentialProvider) Inject(ctx context.Context, vaultID, targetHos
 		if err != nil || policy == PolicyDeny {
 			return nil, ErrServiceNotFound
 		}
-		return &InjectResult{Passthrough: true}, nil
+		return &CredentialMatch{Passthrough: true, vaultID: vaultID}, nil
 	}
 	if !matched.IsEnabled() {
 		return nil, ErrServiceDisabled
@@ -164,6 +191,40 @@ func (p *StoreCredentialProvider) Inject(ctx context.Context, vaultID, targetHos
 		slog.Int("path_prefix_len", score.PathLiteralLen),
 		slog.Int("decl_order", score.DeclOrder),
 	)
+
+	return &CredentialMatch{
+		Filter:         matched.Filter,
+		MatchedName:    matched.Name,
+		MatchedHost:    matched.Host,
+		MatchedPath:    matched.Path,
+		MatchedPort:    matched.Port,
+		CredentialKeys: matched.CredentialKeys(),
+		service:        matched,
+		vaultID:        vaultID,
+	}, nil
+}
+
+// Resolve reads and decrypts the credentials referenced by match. A match is
+// tied to the provider that created it and cannot be manufactured by callers.
+func (p *StoreCredentialProvider) Resolve(ctx context.Context, vaultID string, match *CredentialMatch) (*InjectResult, error) {
+	if match == nil || match.vaultID != vaultID {
+		return nil, ErrServiceNotFound
+	}
+	result := &InjectResult{
+		MatchedName:    match.MatchedName,
+		MatchedHost:    match.MatchedHost,
+		MatchedPath:    match.MatchedPath,
+		MatchedPort:    match.MatchedPort,
+		CredentialKeys: match.CredentialKeys,
+		Passthrough:    match.Passthrough,
+	}
+	if match.Passthrough {
+		return result, nil
+	}
+	if match.service == nil {
+		return result, ErrServiceNotFound
+	}
+	matched := match.service
 
 	// Memoize per-key lookups so a credential shared by auth and a
 	// substitution decrypts only once.
@@ -205,16 +266,6 @@ func (p *StoreCredentialProvider) Inject(ctx context.Context, vaultID, targetHos
 
 		cache[key] = s
 		return s, nil
-	}
-
-	// Capture non-secret metadata up front so a downstream credential-missing
-	// error still carries it for diagnostic logging.
-	result := &InjectResult{
-		MatchedName:    matched.Name,
-		MatchedHost:    matched.Host,
-		MatchedPath:    matched.Path,
-		MatchedPort:    matched.Port,
-		CredentialKeys: matched.CredentialKeys(),
 	}
 
 	// Resolve substitutions before auth so passthrough services (which

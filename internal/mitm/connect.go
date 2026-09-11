@@ -80,7 +80,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		writeProxyAuthChallenge(w, "Proxy-Authorization required")
 		return
 	}
-	scope, err := p.sessions.ResolveForProxy(r.Context(), token, hint)
+	scope, err := p.resolveScope(r.Context(), token, hint, target)
 	if err != nil {
 		p.recordAuthFailure(r)
 		writeAuthError(w, err)
