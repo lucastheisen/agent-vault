@@ -1,3 +1,161 @@
+# Cursor on Codex’s review of the Cursor plan
+
+Source reviewed: `ad_hoc/issue-407/codex-reviews-cursor.md` on `origin/issue-407-codex` (title there: “Codex review: policy-filter plans”).
+
+This file is two parts:
+
+1. **Review of that review** — where Codex is right, where it overfits, what the conversation already locked.
+2. **Updated plan** — the spec that follows. Canonical working copy is also `ad_hoc/issue-407/service-filters.plan.md` (same content as part 2).
+
+Do not include `ad_hoc/` in an upstream PR.
+
+---
+
+# Part 1 — Review of Codex’s review
+
+## Codex’s conclusion
+
+Codex: keep *their* plan as the v1 security core (no dest resolve until continuation; no durable filter credential; separate policy vault; HTTPS remote; no filtered WebSockets). Steal Cursor’s operational lifecycle, timeouts, and examples. Do not steal Cursor’s mint-at-config filter-agent.
+
+**Mostly right on security. Wrong as a full product veto.** The review treats “stronger least privilege” as automatically the v1 bar, and treats conversation-locked product decisions (same vault, filtered WS, HTTP sidecar) as optional polish. Those were not polish. They were the feature.
+
+The correct reading of Codex’s review is: **accept the capability model, reject the product amputations**, and fix Cursor’s actual holes (durable agent, replayable HMAC, missing CA/callback, proposal delete).
+
+---
+
+## Point-by-point on Codex’s comparison table
+
+### Destination credentials — agree, and we under-specified
+
+Codex: equivalent *intent*, their plan states and tests the no-read invariant more explicitly.
+
+**Accept.** “Filter before inject” is not the same as “Match vs Resolve; denied hop never opens the dest DEK.” The updated plan takes their invariant verbatim. This was not a conversation lock; we were sloppy.
+
+### Filter authority — agree; mint-at-config was a bad compromise
+
+Codex: 30s opaque policy capability vs recoverable long-lived filter-agent token. Durable token is a larger theft/rotation target.
+
+**Accept.** Conversation history: the user asked for ephemeral (“duration of the filter”), then rejected per-request **DB** sessions as a write storm. Mint-at-config was our efficiency hack, not a product requirement. Codex’s in-memory map is ephemeral **and** has no SQLite write. That is the design we should have locked in Q6/Q7.
+
+Visible `filter-` agents were an identity-model convenience (`agent list` / revoke). They are not worth a PAT-equivalent sitting in the source vault.
+
+### Vault separation — reject “must differ”; accept dual-admin
+
+Codex: policy vault must be separate; configurator admins both. Cursor default-same is worse least privilege; Cursor even documents that a stolen same-vault filter token can push.
+
+**Half.** Dual-admin when `filter.vault` is *another* vault is an authorization hole we never specified. Adopt it.
+
+**Must-differ is not v1.** Q17–Q18 locked same-vault as the primary value: complex logic in front of the **same** creds. Forcing a second vault makes operators skip the feature or dump write creds into the policy vault anyway.
+
+Codex is reacting to Layout A **as we specified it** (long-lived agent with skip-filter that can push). That risk goes away if the policy capability **cannot spend the originating dest credential** and the push **must** use a single-use continuation. Residual: 30s on *other* unfiltered write services in the same vault. Layout B remains the way to zero that. Document, don’t forbid Layout A.
+
+### Continuation binding — agree
+
+Codex: single-use; method, scheme, authority, escaped path, query; frozen non-secret match. Cursor HMAC: method, host, path, expiry.
+
+**Accept.** HMAC without consume is replayable until expiry with any body. Scheme/query omission is a real bind hole. Frozen match kills TOCTOU if YAML changes mid-window. In-memory consume is not the DB storm we refused.
+
+### Continuation storage — agree with Codex’s trade, not Cursor’s “lighter is better”
+
+Codex: opaque random, in-process, removed on consume/expiry. Cursor: stateless HMAC, dies on restart. Codex says Cursor is lighter; they buy single-use + preserved match.
+
+**Accept Codex storage.** “Lighter” HMAC was the wrong optimization once in-memory exists. Restart fail-closed is the same either way.
+
+**Gap neither review owned until we said it:** process-local capabilities do not work across MITM replicas. v1 is sticky MITM / single process. Do not add a per-hop DB table.
+
+### Filter transport — accept public HTTPS; reject loopback-only HTTP
+
+Codex: remote filter and return path HTTPS; cleartext HTTP only on a **literal loopback IP**. Cursor: any HTTP(S), including public cleartext.
+
+**Accept the actual security win:** do not send continuation/policy bearers over public HTTP.
+
+**Reject literal-loopback-only.** Q10: exemplar is `127.0.0.1` *or a sidecar container*. `http://filter:12345` is the compose case. Dedicated dialer, IMDS still blocked, not `AGENT_VAULT_ALLOW_PRIVATE_RANGES`. Public destinations HTTPS.
+
+Codex also correctly requires an **advertised callback** (`AGENT_VAULT_FILTER_PROXY_URL`) and CA on the hop. Cursor’s hop assumed `vault run` env. Sidecars are not `vault run`. Adopt CA + proxy URLs.
+
+### Header boundary — agree, tighten Cursor
+
+Codex: strip all `X-Agent-Vault-*` at the destination **and** they imply response stripping so a policy API cannot spoof control headers to the agent.
+
+**Accept namespace-wide strip both directions.** Cursor’s per-header broker-scoped list was the right prefix, incomplete boundary.
+
+### Filter recursion — reject “skip all filters”
+
+Codex: policy-vault capabilities cannot invoke another filter (simpler, fail-closed). Cursor: skip continuation or **that** filter-agent (broader self-complete, more exposure).
+
+**Keep Cursor granularity.** Q11-era example: git sidecar must not bypass an unrelated OpenAI filter. Codex’s global skip is simpler and wrong.
+
+Updated rule: continuation skips **this** service’s filter after exact claim. Policy cap **cannot spend originating dest creds** and cannot recurse **this** filter. Other filters still run.
+
+### WebSockets — reject deferral
+
+Codex: defer filtered WS; better v1 boundary unless a concrete use case is required.
+
+**The use case was required.** Q11: git is one example; `api.openai.com` usage-limit / model rewrite may need the upgrade. Skip/Bypass was fail-open or 502-by-default for that service’s WS. We confirmed **Proxy**.
+
+Unfiltered WS stays as today. Filtered WS reverse-proxies to the sidecar. That is not “Cursor more capable therefore later.” It is in-scope v1.
+
+### Request bodies — agree (already equivalent)
+
+Stream; filter that consumes must replay. Unchanged.
+
+### Configuration lifecycle — Codex is asking to adopt work we already did
+
+Codex: Cursor has the stronger operational spec (add/set/clear, list round-trip, sharing, revocation, remint). Their plan should add mutation semantics even without a filter-agent lifecycle.
+
+**Agree they should have copied it; we already had it.** Keep YAML-only, preserve on `add` omit, wipe on `set`/`clear`, list prints `filter`. Sharing/revocation/**remint of agents** goes away with agents. Add what they missed on our side: proposal **delete** of a filtered service is fail-open → reject.
+
+### Failure and timeout — already locked; they should copy us
+
+502/504, existing JSON envelope, origin hop budgets, dedicated dialer/IMDS. Q8, Q10, Q14. Codex asked to add this. We keep it. Clarify 30s = **claim**, not packfile wall clock.
+
+### Scope / implementation size — their “smaller” was “no agent table,” not “less product”
+
+Codex: smaller, lower-risk upstream change (match/resolve + capabilities + existing sessions). Cursor: persistent filter-agent, encrypted token, sharing/revocation, extra APIs.
+
+**Agree the agent machinery was extra risk.** Disagree that dropping WS, same-vault, and private HTTP is what makes a PR reviewable. The updated plan is **smaller schema than old Cursor** (no agents) and **not** smaller than the conversation’s feature.
+
+---
+
+## Codex’s numbered “keep current plan” list
+
+1. No dest credential resolution before continuation — **keep (adopt into Cursor spec).**
+2. Short-lived, exact, single-use continuations carrying original match — **keep.**
+3. Separate policy vault with short-lived policy capability, **not** a durable filter agent — **keep the capability; do not require a separate vault.** Default same; optional `filter.vault`.
+4. Cross-vault admin authorization and no agent-proposal control of filters — **keep dual-admin when vaults differ; keep proposal cannot set/clear; add cannot delete.**
+5. HTTPS for every remote filter or callback hop — **keep for public; private/loopback HTTP remains.**
+6. No filtered WebSockets in v1 — **reject.**
+
+## Codex’s numbered “adopt from Cursor” list
+
+1. Upsert / replace / clear / list-to-set — **already in the spec; keep.**
+2. Timeouts, status codes, envelopes, dial restrictions — **already in; keep; add claim vs stream TTL.**
+3. Explicit non-goals and operator examples — **keep Layout A/B.**
+4. Document deferred filtered-WS + later extension path — **do not defer; implement Proxy as locked.**
+
+---
+
+## What Codex’s review got wrong about the conversation
+
+- **“Durable filter-agent is a poor default.”** True of *that* mechanism. False that the sidecar must therefore be forbidden from same-vault **logic**. Ephemeral policy cap + dest-only-via-continuation is the synthesis.
+- **“Better starting point for upstream v1” = their whole plan.** Upstream will like no dest decrypt and no agent rows. They will not like a feature that cannot run `http://filter:12345` or same-vault git-guard without a second vault.
+- **WebSocket as “more capable.”** It was a closed Q11 decision, not a stretch goal.
+- **Silence on HA.** Both RAM maps die on restart; only Cursor’s old DB token accidentally survived replicas. Call sticky MITM out instead of pretending.
+
+---
+
+## Outcome
+
+Ship a **hybrid spec** (part 2). Do not ship old Cursor (agents + HMAC). Do not ship Codex unchanged (must-differ vault, no filtered WS, loopback-only HTTP).
+
+The implementation on `issue-407-cursor` still matches the **pre-review** agent hop and is out of date relative to part 2.
+
+---
+
+# Part 2 — Updated plan
+
+Canonical file: `ad_hoc/issue-407/service-filters.plan.md`.
+
 # Per-service request filters
 
 Working design for an out-of-process “servlet filter” hop on the MITM proxy: after a service matches, Agent Vault reverse-proxies the live request to an operator-configured URL **without resolving destination credentials**. The sidecar may short-circuit (any HTTP response) or continue through Agent Vault with in-memory capabilities.
