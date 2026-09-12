@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -49,6 +50,12 @@ type mockStore struct {
 	credStores         map[string]*store.VaultCredentialStore // per-vault external credential store config
 	unmatchedHosts     map[string][]store.UnmatchedHost       // keyed by vaultID
 	sessionCounter     int
+
+	// Filter capabilities, keyed by token hash so the fake never holds a
+	// raw capability token either.
+	mu                    sync.Mutex
+	filterCapabilities    map[string]*store.FilterCapability
+	filterCapabilityCount int
 }
 
 func newMockStore() *mockStore {
@@ -230,6 +237,129 @@ func (m *mockStore) RevokeScopedSession(_ context.Context, vaultID, publicID str
 	return sql.ErrNoRows
 }
 
+// --- filter capabilities -------------------------------------------------
+//
+// An in-memory stand-in with the same semantics as the SQL
+// implementation: single-use consume, exact bind, fail-closed on
+// expiry. Keyed by token hash so the fake never holds a raw token
+// either.
+
+func (m *mockStore) filterCaps() map[string]*store.FilterCapability {
+	if m.filterCapabilities == nil {
+		m.filterCapabilities = map[string]*store.FilterCapability{}
+	}
+	return m.filterCapabilities
+}
+
+func (m *mockStore) CreateFilterCapability(_ context.Context, p store.CreateFilterCapabilityParams) (*store.FilterCapability, string, error) {
+	if p.VaultID == "" || p.SourceSessionHash == "" || p.TTL <= 0 {
+		return nil, "", errors.New("invalid filter capability params")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.filterCapabilityCount++
+	prefix := "av_cont_"
+	if p.Kind == store.FilterCapPolicy {
+		prefix = "av_pol_"
+	}
+	raw := fmt.Sprintf("%stest%d", prefix, m.filterCapabilityCount)
+	now := time.Now().UTC()
+	fc := &store.FilterCapability{
+		ID:                fmt.Sprintf("cap-%d", m.filterCapabilityCount),
+		Kind:              p.Kind,
+		FormatVersion:     store.FilterMatchSnapshotVersion,
+		VaultID:           p.VaultID,
+		PolicyVaultID:     p.PolicyVaultID,
+		ActorID:           p.ActorID,
+		SourceSessionHash: p.SourceSessionHash,
+		SourceAgentID:     p.SourceAgentID,
+		ServiceName:       p.ServiceName,
+		Bind:              p.Bind,
+		MatchSnapshot:     p.MatchSnapshot,
+		IssuedAt:          now,
+		ExpiresAt:         now.Add(p.TTL),
+	}
+	m.filterCaps()[store.HashSessionToken(raw)] = fc
+	return fc, raw, nil
+}
+
+func (m *mockStore) GetFilterCapability(_ context.Context, rawToken string) (*store.FilterCapability, error) {
+	if rawToken == "" {
+		return nil, store.ErrFilterCapabilityNotFound
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	fc, ok := m.filterCaps()[store.HashSessionToken(rawToken)]
+	if !ok {
+		return nil, store.ErrFilterCapabilityNotFound
+	}
+	cp := *fc
+	return &cp, nil
+}
+
+func (m *mockStore) ConsumeFilterContinuation(_ context.Context, rawToken string, bind store.FilterCapabilityBind, now time.Time) (*store.FilterCapability, error) {
+	if rawToken == "" {
+		return nil, store.ErrFilterCapabilityNotFound
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	fc, ok := m.filterCaps()[store.HashSessionToken(rawToken)]
+	if !ok {
+		return nil, store.ErrFilterCapabilityNotFound
+	}
+	switch {
+	case fc.Kind != store.FilterCapContinuation:
+		return nil, store.ErrFilterCapabilityKind
+	case fc.ConsumedAt != nil:
+		return nil, store.ErrFilterCapabilityConsumed
+	case fc.IsExpired(now):
+		return nil, store.ErrFilterCapabilityExpired
+	case fc.Bind != bind:
+		return nil, store.ErrFilterCapabilityBind
+	}
+	stamp := now.UTC()
+	fc.ClaimedAt = &stamp
+	fc.ConsumedAt = &stamp
+	cp := *fc
+	return &cp, nil
+}
+
+func (m *mockStore) DeleteFilterCapability(_ context.Context, rawToken string) error {
+	if rawToken == "" {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.filterCaps(), store.HashSessionToken(rawToken))
+	return nil
+}
+
+func (m *mockStore) DeleteExpiredFilterCapabilities(_ context.Context, cutoff time.Time) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var n int64
+	for k, fc := range m.filterCaps() {
+		if !fc.ExpiresAt.After(cutoff) {
+			delete(m.filterCaps(), k)
+			n++
+		}
+	}
+	return n, nil
+}
+
+func (m *mockStore) GetSessionByHash(_ context.Context, tokenHash string) (*store.Session, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for raw, sess := range m.sessions {
+		if store.HashSessionToken(raw) == tokenHash {
+			cp := *sess
+			cp.ID = ""
+			return &cp, nil
+		}
+	}
+	return nil, sql.ErrNoRows
+}
+
 func (m *mockStore) GetSession(_ context.Context, id string) (*store.Session, error) {
 	s, ok := m.sessions[id]
 	if !ok {
@@ -391,9 +521,9 @@ func (m *mockStore) ExpirePendingProposals(_ context.Context, before time.Time) 
 	return 0, nil
 }
 
-func (m *mockStore) Close() error                                     { return nil }
-func (m *mockStore) Ping(_ context.Context) error                      { return nil }
-func (m *mockStore) DialectName() string                               { return "sqlite" }
+func (m *mockStore) Close() error                                         { return nil }
+func (m *mockStore) Ping(_ context.Context) error                         { return nil }
+func (m *mockStore) DialectName() string                                  { return "sqlite" }
 func (m *mockStore) GetCAState(_ context.Context) (*store.CAState, error) { return nil, nil }
 func (m *mockStore) SetCAState(_ context.Context, _ *store.CAState) error { return nil }
 

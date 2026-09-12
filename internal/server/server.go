@@ -267,6 +267,7 @@ type Store interface {
 	CreateUserSession(ctx context.Context, p store.CreateUserSessionParams) (*store.Session, error)
 	CreateScopedSession(ctx context.Context, p store.CreateScopedSessionParams) (*store.Session, error)
 	GetSession(ctx context.Context, id string) (*store.Session, error)
+	GetSessionByHash(ctx context.Context, tokenHash string) (*store.Session, error)
 	DeleteSession(ctx context.Context, id string) error
 	DeleteUserSessions(ctx context.Context, userID string) error
 	TouchSession(ctx context.Context, rawToken, ip, userAgent string) error
@@ -399,6 +400,11 @@ type Store interface {
 	CountAgentTokens(ctx context.Context, agentID string) (int, error)
 	GetLatestAgentTokenExpiry(ctx context.Context, agentID string) (*time.Time, error)
 	DeleteAgentTokens(ctx context.Context, agentID string) error
+	CreateFilterCapability(ctx context.Context, p store.CreateFilterCapabilityParams) (*store.FilterCapability, string, error)
+	GetFilterCapability(ctx context.Context, rawToken string) (*store.FilterCapability, error)
+	ConsumeFilterContinuation(ctx context.Context, rawToken string, bind store.FilterCapabilityBind, now time.Time) (*store.FilterCapability, error)
+	DeleteFilterCapability(ctx context.Context, rawToken string) error
+	DeleteExpiredFilterCapabilities(ctx context.Context, cutoff time.Time) (int64, error)
 	RotateAgentToken(ctx context.Context, agentID string, tokenExpiresAt *time.Time) (*store.Session, error)
 	CreateAgentToken(ctx context.Context, agentID string, expiresAt *time.Time) (*store.Session, error)
 	CountAllOwners(ctx context.Context) (int, error)

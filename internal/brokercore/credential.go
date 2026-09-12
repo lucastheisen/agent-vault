@@ -59,11 +59,51 @@ type InjectResult struct {
 	Passthrough bool
 }
 
+// CredentialMatch is the outcome of matching a request to a service
+// *without* reading or decrypting the destination credential.
+//
+// It is the object a continuation capability freezes. Everything in it
+// is non-secret — service identity plus credential key names — and it is
+// what ResolveMatch works from, so an administrator editing the service
+// during the 30-second continuation window cannot retarget which
+// credential slot ends up attached.
+type CredentialMatch struct {
+	// Passthrough is set when no service matched but the vault's
+	// unmatched-host policy permitted forwarding. Passthrough traffic is
+	// never filtered and never frozen.
+	Passthrough bool
+
+	// Service is a copy of the matched service. Nil on passthrough. Held
+	// by value so a later reload of the vault's service list cannot
+	// alias its way into an in-flight match.
+	Service *broker.Service
+}
+
+// HasFilter reports whether the matched service carries a policy hop.
+func (m *CredentialMatch) HasFilter() bool {
+	return m != nil && !m.Passthrough && m.Service.HasFilter()
+}
+
 // CredentialProvider resolves a service for (targetHost, targetPath) in
 // vaultID and returns the headers to attach. targetPath must be the URL
 // path only — no query, no fragment.
+//
+// Match and ResolveMatch are the two halves of Inject, split so the
+// policy-filter hop can decide on a request before any destination
+// secret is read. Inject remains the whole operation for the ordinary
+// unfiltered path.
 type CredentialProvider interface {
 	Inject(ctx context.Context, vaultID, targetHost string, targetPort int, targetPath string) (*InjectResult, error)
+
+	// Match selects a service without touching credentials. A denied or
+	// unreachable filter must leave the destination credential unread,
+	// and that guarantee starts here.
+	Match(ctx context.Context, vaultID, targetHost string, targetPort int, targetPath string) (*CredentialMatch, error)
+
+	// ResolveMatch decrypts and attaches credentials for an already
+	// matched service. On the filtered path this runs only after a
+	// continuation has been consumed.
+	ResolveMatch(ctx context.Context, vaultID string, m *CredentialMatch) (*InjectResult, error)
 }
 
 // CredentialStore is the minimal store surface used by StoreCredentialProvider.
@@ -109,7 +149,20 @@ func NewStoreCredentialProvider(s CredentialStore, encKey []byte) *StoreCredenti
 // service's auth into HTTP headers. targetHost may include a port —
 // stripped before matching. Pass "/" for targetPath when no path is
 // meaningful.
+//
+// This is Match followed immediately by ResolveMatch: the unfiltered
+// path, where there is nothing to decide before attaching credentials.
 func (p *StoreCredentialProvider) Inject(ctx context.Context, vaultID, targetHost string, targetPort int, targetPath string) (*InjectResult, error) {
+	m, err := p.Match(ctx, vaultID, targetHost, targetPort, targetPath)
+	if err != nil {
+		return nil, err
+	}
+	return p.ResolveMatch(ctx, vaultID, m)
+}
+
+// Match selects the service for (targetHost, targetPath) and stops. No
+// credential is read, no DEK is opened, nothing is decrypted.
+func (p *StoreCredentialProvider) Match(ctx context.Context, vaultID, targetHost string, targetPort int, targetPath string) (*CredentialMatch, error) {
 	// A missing row is equivalent to an empty services list — fall
 	// through to the unmatched-host policy. Any other error fails closed
 	// so a transient store failure can't silently strip enforcement.
@@ -150,7 +203,7 @@ func (p *StoreCredentialProvider) Inject(ctx context.Context, vaultID, targetHos
 		if err != nil || policy == PolicyDeny {
 			return nil, ErrServiceNotFound
 		}
-		return &InjectResult{Passthrough: true}, nil
+		return &CredentialMatch{Passthrough: true}, nil
 	}
 	if !matched.IsEnabled() {
 		return nil, ErrServiceDisabled
@@ -164,6 +217,33 @@ func (p *StoreCredentialProvider) Inject(ctx context.Context, vaultID, targetHos
 		slog.Int("path_prefix_len", score.PathLiteralLen),
 		slog.Int("decl_order", score.DeclOrder),
 	)
+
+	// Copy out of the slice: `services` is re-read from the store on
+	// every call, and a match may outlive this one when it is frozen
+	// into a continuation.
+	svc := *matched
+	return &CredentialMatch{Service: &svc}, nil
+}
+
+// ResolveMatch decrypts the matched service's credentials and builds the
+// headers to attach. On the filtered path this is reached only after a
+// continuation capability has been consumed, so a denied or unreachable
+// filter performs zero credential reads.
+//
+// Credential *values* are deliberately not frozen: a rotation applied
+// during the continuation window attaches the new secret for the same
+// frozen key name.
+func (p *StoreCredentialProvider) ResolveMatch(ctx context.Context, vaultID string, m *CredentialMatch) (*InjectResult, error) {
+	if m == nil {
+		return nil, ErrServiceNotFound
+	}
+	if m.Passthrough {
+		return &InjectResult{Passthrough: true}, nil
+	}
+	if m.Service == nil {
+		return nil, ErrServiceNotFound
+	}
+	matched := m.Service
 
 	// Memoize per-key lookups so a credential shared by auth and a
 	// substitution decrypts only once.

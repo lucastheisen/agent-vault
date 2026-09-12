@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Infisical/agent-vault/internal/broker"
 	"github.com/Infisical/agent-vault/internal/brokercore"
 	"github.com/Infisical/agent-vault/internal/ca"
 	"github.com/Infisical/agent-vault/internal/ratelimit"
@@ -66,9 +67,16 @@ type fakeCredProvider struct {
 type fakeInjectResult struct {
 	result *brokercore.InjectResult
 	err    error
+	// service, when set, is what Match returns. Tests exercising the
+	// policy-filter hop need a real broker.Service (it carries the
+	// filter block); the older tests only declare an injection outcome
+	// and get a synthesized stand-in.
+	service *broker.Service
 }
 
-func (f *fakeCredProvider) Inject(_ context.Context, _, targetHost string, targetPort int, _ string) (*brokercore.InjectResult, error) {
+// lookup resolves the canned outcome for a target, preferring a
+// port-specific entry over a host-wide one.
+func (f *fakeCredProvider) lookup(targetHost string, targetPort int) (fakeInjectResult, bool) {
 	host := targetHost
 	if h, _, err := net.SplitHostPort(targetHost); err == nil {
 		host = h
@@ -76,10 +84,62 @@ func (f *fakeCredProvider) Inject(_ context.Context, _, targetHost string, targe
 	if f.byHostPort != nil && targetPort > 0 {
 		key := net.JoinHostPort(host, fmt.Sprintf("%d", targetPort))
 		if res, ok := f.byHostPort[key]; ok {
-			return res.result, res.err
+			return res, true
 		}
 	}
 	res, ok := f.byHost[host]
+	return res, ok
+}
+
+func (f *fakeCredProvider) Inject(_ context.Context, _, targetHost string, targetPort int, _ string) (*brokercore.InjectResult, error) {
+	res, ok := f.lookup(targetHost, targetPort)
+	if !ok {
+		return nil, brokercore.ErrServiceNotFound
+	}
+	return res.result, res.err
+}
+
+func (f *fakeCredProvider) Match(_ context.Context, _, targetHost string, targetPort int, _ string) (*brokercore.CredentialMatch, error) {
+	res, ok := f.lookup(targetHost, targetPort)
+	if !ok {
+		return nil, brokercore.ErrServiceNotFound
+	}
+	if res.err != nil {
+		return nil, res.err
+	}
+	if res.service != nil {
+		svc := *res.service
+		return &brokercore.CredentialMatch{Service: &svc}, nil
+	}
+	if res.result != nil && res.result.Passthrough {
+		return &brokercore.CredentialMatch{Passthrough: true}, nil
+	}
+	host := targetHost
+	if h, _, err := net.SplitHostPort(targetHost); err == nil {
+		host = h
+	}
+	name := host
+	if res.result != nil && res.result.MatchedName != "" {
+		name = res.result.MatchedName
+	}
+	return &brokercore.CredentialMatch{Service: &broker.Service{Name: name, Host: host}}, nil
+}
+
+func (f *fakeCredProvider) ResolveMatch(_ context.Context, _ string, m *brokercore.CredentialMatch) (*brokercore.InjectResult, error) {
+	if m == nil {
+		return nil, brokercore.ErrServiceNotFound
+	}
+	if m.Passthrough {
+		return &brokercore.InjectResult{Passthrough: true}, nil
+	}
+	if m.Service == nil {
+		return nil, brokercore.ErrServiceNotFound
+	}
+	port := 0
+	if m.Service.Port != nil {
+		port = *m.Service.Port
+	}
+	res, ok := f.lookup(m.Service.Host, port)
 	if !ok {
 		return nil, brokercore.ErrServiceNotFound
 	}

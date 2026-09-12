@@ -35,6 +35,15 @@ func (f *fakeSessionStore) GetSession(_ context.Context, token string) (*store.S
 	}
 	return s, nil
 }
+func (f *fakeSessionStore) GetSessionByHash(_ context.Context, tokenHash string) (*store.Session, error) {
+	for token, sess := range f.sessions {
+		if store.HashSessionToken(token) == tokenHash {
+			return sess, nil
+		}
+	}
+	return nil, errors.New("not found")
+}
+
 func (f *fakeSessionStore) GetVault(_ context.Context, name string) (*store.Vault, error) {
 	v, ok := f.vaults[name]
 	if !ok {
