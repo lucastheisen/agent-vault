@@ -185,6 +185,21 @@ WSS and WS connections also go through the proxy with credential injection — i
 - 502: missing credential or upstream unreachable
 - 502 `oauth_not_connected`: OAuth credential approved but not yet connected — tell the user to complete the connection in the dashboard
 - 502 `oauth_refresh_failed`: OAuth token expired and refresh failed — tell the user to reconnect in the dashboard
+- 502 `filter_unreachable` / 504 `filter_timeout` / 502 `filter_misconfigured`: the host is behind an operator-configured policy filter that could not be reached — tell the user, do not retry in a loop
+- 403 from a policy filter: the operator's filter denied this specific request. The body is the filter's own explanation — relay it rather than retrying
+
+## Policy-filtered services
+
+An operator can put a policy filter in front of a service, so a request is
+handed to their own logic before any credential is attached. You do not
+configure, see, or bypass this:
+
+- Proposals cannot set or clear a `filter` field — it is rejected
+- Proposals cannot delete a service that has one
+- Filtered services do not appear in `/discover`
+
+If a request to an allowed host comes back denied with an explanation, that is
+the operator's policy talking. Report it to the user; do not work around it.
 
 ## Rules
 

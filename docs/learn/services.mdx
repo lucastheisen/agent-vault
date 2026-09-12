@@ -344,6 +344,163 @@ agent-vault vault service set -f services.yaml --vault my-vault
 
 Any [agent](/agents/overview) scoped to the [vault](/learn/vaults) named `my-vault` can now proxy requests to these hosts, and Agent Vault attaches the real [credentials](/learn/credentials) at request time.
 
+## Policy filters
+
+Some decisions cannot be expressed as a matcher. Whether a `git push` is allowed
+might depend on the ref inside the request body and on what a branch-protection
+API says about it. That logic does not belong in Agent Vault, so a service can
+hand the request to a sidecar you run instead.
+
+```yaml
+services:
+  - name: github-push
+    host: github.com/*/git-receive-pack
+    auth:
+      type: bearer
+      token: GITHUB_TOKEN
+    filter:
+      url: https://policy.example.com/github-push
+      policy_vault: dev
+```
+
+When a request matches a filtered service, Agent Vault reverse-proxies it to
+`filter.url` **without decrypting the destination credential**. The sidecar
+either answers directly — any status, and that answer is what the agent sees —
+or completes the request back through Agent Vault, which is the only path that
+attaches the credential.
+
+A denied, timed-out, or unreachable filter performs **zero** reads of the
+destination credential. That is the property the whole feature exists for.
+
+<Note>
+  Filters are administrator-only. Agents cannot set, clear, or delete one
+  through a [proposal](/learn/proposals), and filtered services never appear
+  in `/discover` or the agent skill.
+</Note>
+
+### Field reference
+
+| Field | Required | Meaning |
+|-------|----------|---------|
+| `url` | Yes, when `filter` is present | The sidecar origin. `https` normally; cleartext `http` is allowed to a literal loopback IP, and to any other private address only with `allow_insecure_private_http`. |
+| `policy_vault` | No | The vault a short-lived policy capability is scoped to. **Omitted means no policy capability at all.** |
+| `allow_insecure_private_http` | No | Acknowledges cleartext `http` to a non-loopback sidecar, e.g. a Compose service name. |
+
+### What the sidecar receives
+
+Agent Vault preserves the method, path, query, body, and original `Host`, strips
+the agent's own `Proxy-Authorization`, and adds:
+
+| Header | Meaning |
+|--------|---------|
+| `X-Agent-Vault-Original-URL` | The exact destination the agent asked for. |
+| `X-Agent-Vault-Service` | The matched service name. |
+| `X-Agent-Vault-Continuation-Proxy` | A proxy URL to complete the request through. Contains no credentials. |
+| `X-Agent-Vault-Continuation-Token` | A single-use, 30-second bearer for that proxy. |
+| `X-Agent-Vault-Policy-Proxy` / `-Token` | The same pair for policy calls, present only when `policy_vault` is set. |
+| `X-Agent-Vault-CA` | The MITM root, base64-encoded. A sidecar is not `vault run`, so it needs this to trust the proxy. |
+
+The sidecar sends the matching token as `Proxy-Authorization`. Tokens are
+delivered as headers, never inside the proxy URL, so they stay out of request
+lines and access logs — treat them the same way and do not log or persist them.
+Every `X-Agent-Vault-*` header is stripped from the sidecar's response before it
+reaches the agent.
+
+### The two capabilities
+
+**The continuation** completes one exact request: the same method, scheme,
+authority, escaped path, and query. Changing any of them, or replaying it,
+fails closed. It is bound to the service as it was matched, so editing the
+service during the 30-second window cannot redirect it to a different
+credential — though rotating the *value* of that credential does take effect.
+It cannot retarget the host.
+
+**The policy capability** is optional and only exists when `policy_vault` names
+a vault. It lets the sidecar call *unfiltered* services in that vault, such as a
+branch-protection API. It can never spend the originating request's credential,
+and it cannot invoke **any** filtered service — a sidecar calling a filtered
+endpoint fails rather than starting a second hop.
+
+Thirty seconds is a deadline to claim, not a budget for the work. Once a
+continuation is consumed, the request streams under normal timeouts, and a
+WebSocket bridge runs under the usual 10-minute idle limit. Revoking the agent
+or session behind a capability invalidates it immediately, without waiting for
+the TTL.
+
+### Two layouts
+
+**Layout A — one vault.** `policy_vault` names the service's own vault. The
+sidecar can reach the other, unfiltered services there, which is the simplest
+way to put logic in front of credentials you already have.
+
+```yaml dev-services.yaml
+services:
+  - name: github-api          # unfiltered: the sidecar's side channel
+    host: api.github.com
+    auth:
+      type: bearer
+      token: GITHUB_TOKEN
+
+  - name: github-push
+    host: github.com/*/git-receive-pack
+    auth:
+      type: bearer
+      token: GITHUB_TOKEN
+    filter:
+      url: http://127.0.0.1:12345
+      policy_vault: dev
+```
+
+The tradeoff to understand: a stolen policy capability can reach any *unfiltered*
+service in `dev` for up to 30 seconds. It still cannot push, because that route
+is filtered and only a continuation can spend its credential.
+
+**Layout B — split vault.** Point `policy_vault` at a separate vault holding
+only read-side credentials, and that residual disappears. Configuring this
+requires vault admin on **both** vaults, since it delegates authority across
+them.
+
+### Sidecars in containers
+
+A Compose or Kubernetes sidecar is reached by name, not by loopback IP, so it
+needs the acknowledgement:
+
+```yaml
+filter:
+  url: http://filter:12345
+  policy_vault: dev
+  allow_insecure_private_http: true
+```
+
+This is weaker than TLS, not equivalent to it — capabilities cross a cleartext
+network. With the flag set, every address the name resolves to must be loopback
+or RFC-1918, redirects are disabled, and public, link-local, and cloud-metadata
+addresses stay blocked. `AGENT_VAULT_ALLOW_PRIVATE_RANGES` has no say here; the
+filter hop has its own dialer.
+
+A sidecar on a *different host* also needs
+[`AGENT_VAULT_FILTER_PROXY_URL`](/self-hosting/environment-variables) so it knows
+where to call back.
+
+### When the filter cannot be reached
+
+| Failure | Response |
+|---------|----------|
+| Dial, TLS, or connection reset | `502` with `{"error":"filter_unreachable"}` |
+| No response headers in time | `504` with `{"error":"filter_timeout"}` |
+| Misconfigured filter, or a capability that cannot be issued | `502` with `{"error":"filter_misconfigured"}` |
+
+All three carry `X-Agent-Vault-Proxy-Error: true`, and none of them resolves a
+credential or reaches the destination.
+
+### Editing a filtered service
+
+`vault service add` preserves an existing `filter` when the field is omitted, and
+clears it on an explicit `filter: null`. `vault service set` and
+`vault service clear` replace the whole list, so a filter survives a
+list-then-set round trip only because `vault service list` includes the block —
+if you hand-write the file, carry it across yourself.
+
 ## Managing services
 
 ### Set from a file

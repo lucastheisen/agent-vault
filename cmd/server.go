@@ -217,6 +217,15 @@ func attachMITMIfEnabled(srv *server.Server, host string, mitmPort int, masterKe
 		fmt.Fprintf(os.Stderr, "warning: transparent proxy disabled (CA init failed: %v); pass --mitm-port 0 to suppress\n", err)
 		return nil
 	}
+	// A bad callback URL would be advertised to every sidecar, so say so
+	// loudly and fall back to the loopback listener rather than handing
+	// out an address that leaks capabilities in cleartext.
+	filterProxyURL := os.Getenv("AGENT_VAULT_FILTER_PROXY_URL")
+	if err := mitm.ValidateFilterProxyURL(filterProxyURL); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: ignoring AGENT_VAULT_FILTER_PROXY_URL (%v)\n", err)
+		filterProxyURL = ""
+	}
+
 	srv.AttachMITM(mitm.New(
 		net.JoinHostPort(host, strconv.Itoa(mitmPort)),
 		mitm.Options{
@@ -235,7 +244,7 @@ func attachMITMIfEnabled(srv *server.Server, host string, mitmPort int, masterKe
 				// A sidecar that is not on this host cannot reach a
 				// loopback listener, so a remote deployment has to be
 				// told where to call back.
-				ProxyBaseURL: os.Getenv("AGENT_VAULT_FILTER_PROXY_URL"),
+				ProxyBaseURL: filterProxyURL,
 			},
 		},
 	))

@@ -8,6 +8,7 @@ An HTTP brokerage layer for AI agents. Sits between development agents (Claude C
 make build        # Builds frontend (React/Vite) then Go binary → ./agent-vault
 make web-dev      # Frontend-only hot reload (Vite on 5173, proxies API to Go on 14321)
 make test         # go test ./...
+make test-smoke   # Build-tagged end-to-end policy-filter run (real store + CA + MITM + sidecar)
 make docker       # Multi-stage Docker image; data persisted at /data/.agent-vault/
 ```
 
@@ -23,6 +24,7 @@ make docker       # Multi-stage Docker image; data persisted at /data/.agent-vau
 ## Core concepts (mental model)
 
 - **Single ingress into the broker — transparent MITM** (on by default, port 14322, disable with `--mitm-port 0`): plain HTTP forward-proxy ingress backed by [internal/mitm](internal/mitm/) + [internal/ca](internal/ca/) (software CA, root key encrypted with the master key). The listener accepts both `CONNECT host:port` (HTTPS upstreams) and absolute-form forward-proxy requests (`POST http://host/path HTTP/1.1`, RFC 7230 §5.3.2) for plain-HTTP upstreams on the same port. Clients use `HTTPS_PROXY=http://...` and `HTTP_PROXY=http://...` — both point at the same proxy URL. Deploy on a trusted/private network. Credential injection lives in `brokercore`. HTTP/1.1 at the ingress, with transparent WebSocket upgrade support (HTTP/2 not yet). Bind failures are non-fatal — the core HTTP server keeps running.
+- **Per-service policy filters** ([internal/mitm/filter.go](internal/mitm/filter.go)): a service may carry a `filter` block (YAML, admin-only) naming a sidecar URL. A matched request is reverse-proxied there *before* the destination credential is decrypted; the sidecar either answers it or completes it through Agent Vault with a single-use 30s **continuation** capability, optionally alongside a **policy** capability scoped to a `policy_vault` for side-channel calls. `CredentialProvider` is split into `Match` (no decrypt) and `ResolveMatch` (decrypt) to make that boundary real. Capabilities are shared TTL rows in the DB (token hash + versioned frozen-match snapshot + source session hash), so callbacks work across replicas and revoking the source agent kills them immediately.
 - **Proposals = GitHub-PR-style change requests.** Agents cannot edit services or credentials directly; they create proposals, a human approves in CLI or browser, and apply merges atomically. Per-vault sequential IDs. 7-day TTL.
 - **Two independent permission axes**:
   - Instance role: `no-access` < `member` < `owner` (applies to both users and agents). `no-access` actors can authenticate and operate inside vaults they're granted to, but cannot create vaults, issue invites, or list other actors at the instance scope.

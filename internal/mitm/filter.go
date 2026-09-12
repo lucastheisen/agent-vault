@@ -598,3 +598,37 @@ func newFlushingWriter(w http.ResponseWriter) io.Writer {
 	}
 	return w
 }
+
+// ValidateFilterProxyURL checks an AGENT_VAULT_FILTER_PROXY_URL value.
+//
+// This is the address a sidecar is told to send capabilities to, so the
+// same transport rule as filter.url applies in reverse: TLS, unless it
+// is unambiguously a literal loopback address and therefore never
+// crosses a network at all.
+func ValidateFilterProxyURL(raw string) error {
+	if raw == "" {
+		return nil
+	}
+	u, err := url.Parse(strings.TrimRight(raw, "/"))
+	if err != nil {
+		return fmt.Errorf("AGENT_VAULT_FILTER_PROXY_URL %q is not a valid URL", raw)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("AGENT_VAULT_FILTER_PROXY_URL %q must include a host", raw)
+	}
+	if u.User != nil {
+		return fmt.Errorf("AGENT_VAULT_FILTER_PROXY_URL %q must not contain userinfo", raw)
+	}
+	switch u.Scheme {
+	case "https":
+		return nil
+	case "http":
+		if broker.IsLoopbackURLHost(u.Host) {
+			return nil
+		}
+		return fmt.Errorf("AGENT_VAULT_FILTER_PROXY_URL %q is cleartext http to a non-loopback host — "+
+			"a sidecar sends capabilities to this address, so it must be https", raw)
+	default:
+		return fmt.Errorf("AGENT_VAULT_FILTER_PROXY_URL %q must use http or https", raw)
+	}
+}

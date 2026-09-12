@@ -190,6 +190,39 @@ Want a full deployment walkthrough? See [Run Hermes on a VPS](https://docs.agent
 
 3. Tokens: You should create an [agent](https://docs.agent-vault.dev/agents/overview) in Agent Vault to represent a long-lived agent. For ephemeral sandboxes, you may prefer to mint short-lived, vault-scoped tokens for sandboxed agents to use to proxy requests through Agent Vault.
 
+## Policy Filters
+
+A service can route matched requests through a sidecar you run, before Agent
+Vault decrypts anything:
+
+```yaml
+services:
+  - name: github-push
+    host: github.com/*/git-receive-pack
+    auth:
+      type: bearer
+      token: GITHUB_TOKEN
+    filter:
+      url: https://policy.example.com/github-push
+      policy_vault: dev
+```
+
+The sidecar sees the live request and either answers it directly — any status,
+and that answer is what the agent gets — or completes it back through Agent
+Vault with a single-use, 30-second capability. Only that second path attaches
+the credential, so a denial, a timeout, or an unreachable sidecar costs zero
+reads of it.
+
+This is where logic that cannot be expressed as a host matcher goes: is this ref
+protected, is this model allowed, has this agent spent its budget. Agent Vault
+stays out of it — no rules language, no plugins, just an HTTP hop to code you
+own. Filters are administrator-only and invisible to agents: a proposal cannot
+add one, remove one, or delete a service that has one.
+
+See [Policy filters](https://docs.agent-vault.dev/learn/services#policy-filters)
+for the capability model, the container-sidecar setup, and the two vault
+layouts.
+
 ## PostgreSQL (Production)
 
 By default Agent Vault stores all state in a local SQLite database, which requires no setup. For production deployments, or when running multiple instances, set the `DATABASE_URL` environment variable (or `--database-url` flag) to a PostgreSQL connection string and Agent Vault switches to Postgres as its backend. All instances share the same database, so state is consistent across replicas.

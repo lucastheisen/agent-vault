@@ -587,3 +587,52 @@ func TestFilteredServiceWithoutEngineFailsClosed(t *testing.T) {
 		t.Errorf("status = %d, want 502 — filtering unavailable is not filtering skipped", resp.StatusCode)
 	}
 }
+
+func TestValidateFilterProxyURL(t *testing.T) {
+	tests := []struct {
+		raw     string
+		wantErr string // substring; "" means valid
+	}{
+		{"", ""},
+		{"https://agent-vault.example.com:14322", ""},
+		{"https://agent-vault.example.com:14322/", ""},
+		{"http://127.0.0.1:14322", ""},
+		{"http://[::1]:14322", ""},
+		// A sidecar sends capabilities here, so cleartext off-host is out.
+		{"http://agent-vault.example.com:14322", "must be https"},
+		{"http://localhost:14322", "must be https"},
+		{"http://10.0.0.5:14322", "must be https"},
+		{"https://user:pass@av.example.com", "must not contain userinfo"},
+		{"ftp://av.example.com", "must use http or https"},
+		{"not-a-url", "must include a host"},
+	}
+	for _, tc := range tests {
+		err := ValidateFilterProxyURL(tc.raw)
+		if tc.wantErr == "" {
+			if err != nil {
+				t.Errorf("ValidateFilterProxyURL(%q) = %v, want nil", tc.raw, err)
+			}
+			continue
+		}
+		if err == nil {
+			t.Errorf("ValidateFilterProxyURL(%q) = nil, want an error containing %q", tc.raw, tc.wantErr)
+			continue
+		}
+		if !strings.Contains(err.Error(), tc.wantErr) {
+			t.Errorf("ValidateFilterProxyURL(%q) = %q, want it to contain %q", tc.raw, err, tc.wantErr)
+		}
+	}
+}
+
+// With a callback configured, that is what the sidecar is told; without
+// one, the sidecar gets this process's real bound address.
+func TestFilterCallbackURL(t *testing.T) {
+	configured := newFilterEngine(FilterOptions{ProxyBaseURL: "https://av.example.com:14322/"})
+	if got := configured.callbackURL("127.0.0.1:9999"); got != "https://av.example.com:14322" {
+		t.Errorf("callbackURL = %q, want the configured value with the trailing slash trimmed", got)
+	}
+	local := newFilterEngine(FilterOptions{})
+	if got := local.callbackURL("127.0.0.1:9999"); got != "http://127.0.0.1:9999" {
+		t.Errorf("callbackURL = %q, want the local listener", got)
+	}
+}
