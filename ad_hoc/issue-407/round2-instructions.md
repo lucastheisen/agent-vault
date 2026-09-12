@@ -1,3 +1,7 @@
+# Round 2
+
+## Phase 1
+
 There are three branches:
 
 * issue-407-claude
@@ -15,15 +19,23 @@ Claude found 6 items, 2 of which are blocking.
 This review i son the `issue-407-claude` branch named `claude_reviews_codex_and_cursor_combined.md`
 
 Now, all 3 agents have completed an implementation based on the settled plan and pushed it to their branch.
-It is your job to:
+It is your job to execute the following tasks:
 
-* review the other 2 agents, supply a synopsis of what they did well, what the didn't do well compaired to your implementation.
-* generate a `service-filters-round2.plan.md` that defines the supplimental information to the orignal plan that incorporates all that was learned from reviewing the other 2 AND incorporating the 2 blockers from `claude_reviews_codex_and_cursor_combined.md`, and optionally the other 4 findings if you consider them necessary
+1. review the other 2 agents, supply a synopsis of what they did well, what the didn't do well compaired to your implementation.
+2. generate a `service-filters-round2.plan.md` that defines the supplimental information to the orignal plan that incorporates all that was learned from reviewing the other 2 AND incorporating the 2 blockers from `claude_reviews_codex_and_cursor_combined.md`, and optionally the other 4 findings if you consider them necessary
+3. commit to your branch and prepare a handoff push
 
 This should be considered a _supplimental plan_ that would be combined with the _original plan_ to comprise a complete plan for the entire feature implementation.
 This is NOT to include the information from the original plan (unless it is a modification of some item in the original).
 
-After all 3 of you have generated your round2 supplimental plans and pushed them to your respective branches we will review each others work until we come to a unified final plan.
-This final plan will be written to `ad_hoc/issue-407/service-filters-final.plan.md`.
+# Phase 2
+
+After all 3 of you have generated your round2 supplimental plans and pushed them to your respective branches we will perform the following tasks:
+
+1. review each others work and propose changes iteratively with the user until the user is satisfied.
+2. write a final plan to `ad_hoc/issue-407/service-filters-final.plan.md`.
+3. commit to your branch and prepare a handoff push
+
+# Phase 3
 
 Finally, we will have you implement the final plan from a clean branch incorporating everything we learned along the way.
