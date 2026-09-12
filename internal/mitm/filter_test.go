@@ -636,3 +636,116 @@ func TestFilterCallbackURL(t *testing.T) {
 		t.Errorf("callbackURL = %q, want the local listener", got)
 	}
 }
+
+// A sidecar that never starts answering is a 504, distinct from a
+// sidecar that cannot be reached at all, and still costs nothing.
+func TestFilterTimeoutIs504(t *testing.T) {
+	release := make(chan struct{})
+	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer func() {
+		close(release)
+		sidecar.Close()
+	}()
+
+	h := newFilterHarness(t, sidecar.URL, "")
+	// Shrink the response-header budget so the test does not wait out
+	// the production one.
+	h.proxy.filter.tls.Transport.(*http.Transport).ResponseHeaderTimeout = 150 * time.Millisecond
+	h.proxy.filter.cleartext.Transport.(*http.Transport).ResponseHeaderTimeout = 150 * time.Millisecond
+
+	resp, err := h.client().Get(h.originURL + "/x")
+	if err != nil {
+		t.Fatalf("client.Do: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusGatewayTimeout {
+		t.Errorf("status = %d, want 504", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "filter_timeout") {
+		t.Errorf("body = %q, want the filter_timeout code", body)
+	}
+	if got := h.resolves.Load(); got != 0 {
+		t.Errorf("ResolveMatch ran %d times on a filter timeout, want 0", got)
+	}
+	if got := h.originHits.Load(); got != 0 {
+		t.Errorf("origin saw %d requests, want 0", got)
+	}
+}
+
+// Editing the service while a continuation is outstanding must not
+// retarget it. This is observable because the continuation path does
+// not consult the matcher at all: the service is removed from the
+// matcher entirely mid-flight, and the continuation still completes
+// from the snapshot it was issued against.
+func TestContinuationIgnoresServiceEditMidWindow(t *testing.T) {
+	origin, originHits := newFilterOrigin(t)
+
+	var liveMatchAfterEdit atomic.Int32
+	sidecar := newRecordingSidecar(t, func(w http.ResponseWriter, r *http.Request, s *continuingSidecar) {
+		h := harnessRef.Load().(*filterHarness)
+
+		// The admin rewrites the vault mid-window: this service no longer
+		// matches anything. A live match would now 403.
+		h.creds.byHost = map[string]fakeInjectResult{}
+
+		// Prove that claim rather than assuming it — a fresh session
+		// request for the same URL is now unmatched.
+		if probe, err := h.client().Get(r.Header.Get(HeaderOriginalURL)); err == nil {
+			liveMatchAfterEdit.Store(int32(probe.StatusCode))
+			_ = probe.Body.Close()
+		}
+
+		client := capHTTPClient(t, s.callback(), s.continuation(), h.clientRoots)
+		resp, err := client.Get(r.Header.Get(HeaderOriginalURL))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+		w.Header().Set("X-Origin-Auth", resp.Header.Get("X-Origin-Auth"))
+		w.WriteHeader(resp.StatusCode)
+	})
+
+	h := newFilterHarnessFor(t, origin, originHits, sidecar.server.URL, "")
+	// Resolution is keyed by service name, so it survives the matcher
+	// being emptied — exactly as the real provider resolves the frozen
+	// service's credential keys.
+	h.creds.byName = map[string]fakeInjectResult{
+		"github-push": {result: &brokercore.InjectResult{
+			MatchedName: "github-push",
+			Headers:     map[string]string{"Authorization": "Bearer dest-secret"},
+		}},
+	}
+	harnessRef.Store(h)
+
+	resp, err := h.client().Get(origin.URL + "/x")
+	if err != nil {
+		t.Fatalf("client.Do: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if got := liveMatchAfterEdit.Load(); got != http.StatusForbidden {
+		t.Fatalf("a live match after the edit returned %d, want 403 — the edit did not take", got)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200: the continuation must survive the edit", resp.StatusCode)
+	}
+	if got := resp.Header.Get("X-Origin-Auth"); got != "Bearer dest-secret" {
+		t.Errorf("origin Authorization = %q, want the frozen service's credential", got)
+	}
+	if got := originHits.Load(); got != 1 {
+		t.Errorf("origin saw %d requests, want 1", got)
+	}
+}
+
+// harnessRef carries the harness into a sidecar closure that has to be
+// built before the harness exists.
+var harnessRef atomic.Value

@@ -62,6 +62,13 @@ type fakeCredProvider struct {
 	// byHostPort maps "host:port" to the injection outcome. Checked
 	// before byHost so port-specific entries take precedence.
 	byHostPort map[string]fakeInjectResult
+
+	// byName resolves a match by service name, independent of the
+	// matcher maps above. It exists so a test can make a *live* match
+	// fail while a previously frozen match still resolves — which is the
+	// only way to observe that the continuation path never re-runs the
+	// matcher.
+	byName map[string]fakeInjectResult
 }
 
 type fakeInjectResult struct {
@@ -142,6 +149,11 @@ func (f *fakeCredProvider) ResolveMatch(_ context.Context, _ string, m *brokerco
 	}
 	if m.Service == nil {
 		return nil, brokercore.ErrServiceNotFound
+	}
+	if f.byName != nil {
+		if res, ok := f.byName[m.Service.Name]; ok {
+			return res.result, res.err
+		}
 	}
 	port := 0
 	if m.Service.Port != nil {

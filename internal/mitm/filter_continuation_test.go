@@ -418,3 +418,54 @@ func TestPolicyCapabilityMayUse(t *testing.T) {
 		t.Error("policy capability must not be able to use a filtered service")
 	}
 }
+
+// Decision 9 both ways: the reserved namespace never reaches an origin
+// either, which matters most on the continuation path because that
+// request was assembled by a sidecar holding capability headers.
+func TestReservedHeadersNeverReachTheOrigin(t *testing.T) {
+	var sawReserved atomic.Value
+	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var found []string
+		for name := range r.Header {
+			if strings.HasPrefix(http.CanonicalHeaderKey(name), "X-Agent-Vault-") {
+				found = append(found, name)
+			}
+		}
+		sawReserved.Store(strings.Join(found, ","))
+		_, _ = io.WriteString(w, "origin-body")
+	}))
+	defer origin.Close()
+	originHits := &atomic.Int32{}
+
+	var roots *x509.CertPool
+	sidecar := newRecordingSidecar(t, func(w http.ResponseWriter, r *http.Request, s *continuingSidecar) {
+		client := capHTTPClient(t, s.callback(), s.continuation(), roots)
+		req, _ := http.NewRequest("GET", origin.URL+"/x", nil)
+		// A sidecar echoing its own capability headers onward must not
+		// leak them to the destination.
+		req.Header.Set(HeaderContinuationToken, s.continuation())
+		req.Header.Set(HeaderService, "github-push")
+		resp, err := client.Do(req)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+		w.WriteHeader(resp.StatusCode)
+	})
+
+	h := newFilterHarnessFor(t, origin, originHits, sidecar.server.URL, "")
+	roots = h.clientRoots
+
+	req, _ := http.NewRequest("GET", origin.URL+"/x", nil)
+	req.Header.Set(HeaderOriginalURL, "https://client-forgery.example.com")
+	resp, err := h.client().Do(req)
+	if err != nil {
+		t.Fatalf("client.Do: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if got, _ := sawReserved.Load().(string); got != "" {
+		t.Errorf("origin received reserved headers: %s", got)
+	}
+}

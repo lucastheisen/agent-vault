@@ -389,6 +389,12 @@ func (p *Proxy) forwardRequest(
 	} else {
 		brokercore.ApplyInjection(r.Header, outReq.Header, inject)
 	}
+	// The reserved namespace never reaches an origin. It matters most on
+	// the continuation path, where the request was built by a sidecar
+	// that was just handed capability headers, but it holds for every
+	// request: these headers are Agent Vault's own control channel and a
+	// client has no business forging them at an upstream.
+	stripNamespace(outReq.Header)
 
 	if err := brokercore.ApplySubstitutions(outReq.URL, outReq.Header, inject.Substitutions); err != nil {
 		http.Error(w, "bad gateway", http.StatusBadGateway)
