@@ -507,6 +507,10 @@ type Store interface {
 	CreateUserSession(ctx context.Context, p CreateUserSessionParams) (*Session, error)
 	CreateScopedSession(ctx context.Context, p CreateScopedSessionParams) (*Session, error)
 	GetSession(ctx context.Context, id string) (*Session, error)
+	// GetSessionByHash resolves a session from its stored primary key
+	// instead of the raw token, so a filter capability can re-check that
+	// its source authority is still live without holding that token.
+	GetSessionByHash(ctx context.Context, tokenHash string) (*Session, error)
 	DeleteSession(ctx context.Context, id string) error
 	// ListScopedSessionsByVault returns active vault-scoped tokens for the
 	// vault, most recent first. Used by the Tokens tab.
@@ -593,6 +597,15 @@ type Store interface {
 	// in a single transaction so the agent is never stranded without a token.
 	RotateAgentToken(ctx context.Context, agentID string, tokenExpiresAt *time.Time) (*Session, error)
 	CreateAgentToken(ctx context.Context, agentID string, expiresAt *time.Time) (*Session, error)
+
+	// Filter capabilities — short-lived authorities minted on the
+	// policy-filter hop. Rows carry a token hash and a non-secret frozen
+	// match, never a credential value or a usable token.
+	CreateFilterCapability(ctx context.Context, p CreateFilterCapabilityParams) (*FilterCapability, string, error)
+	GetFilterCapability(ctx context.Context, rawToken string) (*FilterCapability, error)
+	ConsumeFilterContinuation(ctx context.Context, rawToken string, bind FilterCapabilityBind, now time.Time) (*FilterCapability, error)
+	DeleteFilterCapability(ctx context.Context, rawToken string) error
+	DeleteExpiredFilterCapabilities(ctx context.Context, cutoff time.Time) (int64, error)
 	CountAllOwners(ctx context.Context) (int, error)
 
 	// Instance settings

@@ -1709,7 +1709,21 @@ func (s *SQLStore) RevokeScopedSession(ctx context.Context, vaultID, publicID st
 }
 
 func (s *SQLStore) GetSession(ctx context.Context, rawToken string) (*Session, error) {
-	tokenHash := hashSessionToken(rawToken)
+	sess, err := s.scanSessionRow(ctx, hashSessionToken(rawToken))
+	if err != nil {
+		return nil, err
+	}
+	// Return the raw token as ID (not the hash) so callers can reference it.
+	sess.ID = rawToken
+	return sess, nil
+}
+
+// scanSessionRow loads a session by its stored primary key (the hashed
+// token). It leaves Session.ID empty; callers decide what identity, if
+// any, belongs there — GetSession puts the raw token back, while
+// GetSessionByHash deliberately leaves it blank so a hash can never be
+// mistaken for a usable token.
+func (s *SQLStore) scanSessionRow(ctx context.Context, tokenHash string) (*Session, error) {
 	row := s.db.QueryRowContext(ctx,
 		s.dialect.Rebind(`SELECT id, user_id, vault_id, agent_id, vault_role, expires_at, created_at,
 		        last_used_at, idle_ttl_seconds, device_label, last_ip, last_user_agent, public_id,
@@ -1730,8 +1744,6 @@ func (s *SQLStore) GetSession(ctx context.Context, rawToken string) (*Session, e
 		&label, &createdByActorID, &createdByActorType); err != nil {
 		return nil, err
 	}
-	// Return the raw token as ID (not the hash) so callers can reference it.
-	sess.ID = rawToken
 	sess.UserID = userID.String
 	sess.VaultID = vaultID.String
 	sess.AgentID = agentID.String
