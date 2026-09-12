@@ -587,7 +587,7 @@ func (p *Proxy) serveFilterWebSocket(
 
 	// No substitutions on this hop: nothing has been resolved yet, which
 	// is the entire point of running the filter first.
-	p.forwardWebSocket(w, r, hopReq, nil, emit, p.filter.dialer(filterURL))
+	p.forwardWebSocket(w, r, hopReq, nil, emit, p.filter.dialer(filterURL), true)
 }
 
 // dialer exposes the transport a filter URL should travel on, for the

@@ -64,6 +64,7 @@ func (p *Proxy) forwardWebSocket(
 	wsSubs []brokercore.ResolvedSubstitution,
 	emit func(status int, errCode string),
 	dial dialFunc,
+	stripReserved bool,
 ) {
 	upstreamConn, upstreamReader, resp, err := p.dialWebSocketUpstream(r.Context(), outReq, dial)
 	if err != nil {
@@ -90,6 +91,13 @@ func (p *Proxy) forwardWebSocket(
 
 		for k, vv := range resp.Header {
 			if brokercore.ShouldStripResponseHeader(k) {
+				continue
+			}
+			// On a filter hop the answer comes from a policy sidecar, not
+			// an origin: strip the reserved namespace so it cannot spoof
+			// a control header at the agent. The 101 path needs no such
+			// guard — it copies from a fixed allowlist.
+			if stripReserved && strings.HasPrefix(http.CanonicalHeaderKey(k), headerNamespace) {
 				continue
 			}
 			for _, v := range vv {

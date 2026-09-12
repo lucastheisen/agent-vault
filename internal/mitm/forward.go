@@ -422,7 +422,7 @@ func (p *Proxy) forwardRequest(
 		if len(wsSubs) > 0 {
 			outReq.Header.Del("Sec-Websocket-Extensions")
 		}
-		p.forwardWebSocket(w, r, outReq, wsSubs, emit, nil)
+		p.forwardWebSocket(w, r, outReq, wsSubs, emit, nil, false)
 		return
 	}
 
