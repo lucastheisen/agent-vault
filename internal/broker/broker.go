@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+
+	"gopkg.in/yaml.v3"
 )
 
 // Config represents a vault's broker configuration as stored in YAML files.
@@ -37,15 +39,27 @@ type Service struct {
 	Auth          Auth           `yaml:"auth" json:"auth"`
 	Filter        *Filter        `yaml:"filter,omitempty" json:"filter,omitempty"`
 	Substitutions []Substitution `yaml:"substitutions,omitempty" json:"substitutions,omitempty"`
+	FilterOp      FilterOp       `yaml:"-" json:"-"`
 }
+
+// FilterOp preserves the three-way filter lifecycle on service-add input.
+// Omitted means preserve, an object means set, and explicit null means clear.
+type FilterOp uint8
+
+const (
+	FilterOpOmit FilterOp = iota
+	FilterOpSet
+	FilterOpClear
+)
 
 // Filter delegates a matching request to a trusted policy service
 // before Agent Vault injects the service credential. PolicyVault, when set,
-// supplies that service with a short-lived proxy capability scoped to a
-// separate vault.
+// supplies that service with a short-lived proxy capability scoped to the
+// named vault, which may be the service's own vault.
 type Filter struct {
-	PolicyVault string `yaml:"policy_vault,omitempty" json:"policy_vault,omitempty"`
-	URL         string `yaml:"url" json:"url"`
+	AllowInsecurePrivateHTTP bool   `yaml:"allow_insecure_private_http,omitempty" json:"allow_insecure_private_http,omitempty"`
+	PolicyVault              string `yaml:"policy_vault,omitempty" json:"policy_vault,omitempty"`
+	URL                      string `yaml:"url" json:"url"`
 }
 
 // MatcherPattern returns the joined inline form (`slack.com/api/*`),
@@ -67,7 +81,42 @@ func (s Service) MarshalJSON() ([]byte, error) {
 	a.Host = s.MatcherPattern()
 	a.Path = ""
 	a.Port = nil
-	return json.Marshal(a)
+	raw, err := json.Marshal(a)
+	if err != nil || s.FilterOp != FilterOpClear {
+		return raw, err
+	}
+	// Filter is nil and omitted by the alias. Re-introduce an explicit null so
+	// YAML `filter: null` survives the CLI's YAML→JSON conversion.
+	if len(raw) == 0 || raw[len(raw)-1] != '}' {
+		return nil, fmt.Errorf("marshal service filter clear")
+	}
+	return append(raw[:len(raw)-1], []byte(`,"filter":null}`)...), nil
+}
+
+// UnmarshalYAML records whether filter was omitted, set, or explicitly null.
+func (s *Service) UnmarshalYAML(node *yaml.Node) error {
+	type plain Service
+	var decoded plain
+	if err := node.Decode(&decoded); err != nil {
+		return err
+	}
+	*s = Service(decoded)
+	s.FilterOp = FilterOpOmit
+	if node.Kind == yaml.MappingNode {
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			if node.Content[i].Value != "filter" {
+				continue
+			}
+			if node.Content[i+1].Tag == "!!null" {
+				s.Filter = nil
+				s.FilterOp = FilterOpClear
+			} else {
+				s.FilterOp = FilterOpSet
+			}
+			break
+		}
+	}
+	return nil
 }
 
 // Substitution declares a placeholder string the broker rewrites with a
@@ -397,8 +446,9 @@ func Validate(cfg *Config) error {
 	return nil
 }
 
-// Validate checks that remote filters use HTTPS while allowing plain HTTP for
-// a same-host loopback service.
+// Validate allows plain HTTP to literal loopback addresses, or to hostnames and
+// literal RFC1918 addresses when the operator explicitly opts in. The filter
+// dialer separately enforces the same rule against every resolved address.
 func (f *Filter) Validate() error {
 	if f == nil {
 		return nil
@@ -421,8 +471,12 @@ func (f *Filter) Validate() error {
 	}
 	if u.Scheme == "http" {
 		ip := net.ParseIP(u.Hostname())
-		if ip == nil || !ip.IsLoopback() {
-			return fmt.Errorf("filter: http url host must be a loopback IP address")
+		if !f.AllowInsecurePrivateHTTP {
+			if ip == nil || !ip.IsLoopback() {
+				return fmt.Errorf("filter: http url host must be a loopback IP address unless allow_insecure_private_http is set")
+			}
+		} else if ip != nil && !ip.IsLoopback() && !isRFC1918(ip) {
+			return fmt.Errorf("filter: insecure http url host must resolve only to loopback or RFC1918 addresses")
 		}
 	}
 	if f.PolicyVault != "" {
@@ -431,6 +485,16 @@ func (f *Filter) Validate() error {
 		}
 	}
 	return nil
+}
+
+func isRFC1918(ip net.IP) bool {
+	ip = ip.To4()
+	if ip == nil {
+		return false
+	}
+	return ip[0] == 10 ||
+		(ip[0] == 172 && ip[1] >= 16 && ip[1] <= 31) ||
+		(ip[0] == 192 && ip[1] == 168)
 }
 
 // ValidateSubstitutions checks each substitution for length, character

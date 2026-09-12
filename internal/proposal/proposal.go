@@ -51,6 +51,31 @@ type Service struct {
 	Auth          *broker.Auth          `json:"auth,omitempty"`
 	Filter        *broker.Filter        `json:"filter,omitempty"`
 	Substitutions []broker.Substitution `json:"substitutions,omitempty"`
+	filterSet     bool
+}
+
+// UnmarshalJSON records whether filter appeared on the wire, including an
+// explicit JSON null. Proposals may not set or clear an admin-configured
+// filter, so treating null like an omitted field would create a policy bypass.
+func (s *Service) UnmarshalJSON(data []byte) error {
+	type alias Service
+	var decoded alias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	*s = Service(decoded)
+	_, s.filterSet = fields["filter"]
+	return nil
+}
+
+// FilterSpecified reports whether a proposal attempted to include the filter
+// field. It is intentionally true for both an object and explicit null.
+func (s Service) FilterSpecified() bool {
+	return s.filterSet || s.Filter != nil
 }
 
 // MatcherPattern returns the joined inline form (`slack.com/api/*`),

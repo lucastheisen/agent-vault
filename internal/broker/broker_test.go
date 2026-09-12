@@ -2,9 +2,12 @@ package broker
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestMatchServiceExact(t *testing.T) {
@@ -657,6 +660,21 @@ func TestFilterValidate(t *testing.T) {
 	t.Run("rejects remote HTTP", func(t *testing.T) {
 		tester(t, &Filter{URL: "http://policy.example.com/git-push"}, "loopback")
 	})
+	t.Run("allows opted-in private HTTP hostname", func(t *testing.T) {
+		tester(t, &Filter{URL: "http://filter:23875/git-push", AllowInsecurePrivateHTTP: true}, "")
+	})
+	t.Run("allows opted-in RFC1918 HTTP address", func(t *testing.T) {
+		tester(t, &Filter{URL: "http://10.0.0.2:23875/git-push", AllowInsecurePrivateHTTP: true}, "")
+	})
+	t.Run("rejects opted-in public HTTP address", func(t *testing.T) {
+		tester(t, &Filter{URL: "http://8.8.8.8:23875/git-push", AllowInsecurePrivateHTTP: true}, "RFC1918")
+	})
+	t.Run("rejects opted-in link-local HTTP address", func(t *testing.T) {
+		tester(t, &Filter{URL: "http://169.254.169.254/latest", AllowInsecurePrivateHTTP: true}, "RFC1918")
+	})
+	t.Run("rejects opted-in IPv6 ULA HTTP address", func(t *testing.T) {
+		tester(t, &Filter{URL: "http://[fd00::1]:23875/check", AllowInsecurePrivateHTTP: true}, "RFC1918")
+	})
 	t.Run("rejects URL credentials", func(t *testing.T) {
 		tester(t, &Filter{URL: "https://user:secret@policy.example.com/git-push"}, "without userinfo")
 	})
@@ -666,6 +684,23 @@ func TestFilterValidate(t *testing.T) {
 	t.Run("rejects invalid policy vault names", func(t *testing.T) {
 		tester(t, &Filter{URL: "https://policy.example.com/git-push", PolicyVault: "Not A Slug"}, "policy_vault")
 	})
+}
+
+func TestServiceYAMLFilterNullSurvivesJSONConversion(t *testing.T) {
+	var cfg Config
+	if err := yaml.Unmarshal([]byte("vault: default\nservices:\n  - name: api\n    host: api.example.com\n    auth:\n      type: passthrough\n    filter: null\n"), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Services) != 1 || cfg.Services[0].FilterOp != FilterOpClear {
+		t.Fatalf("filter op = %v", cfg.Services)
+	}
+	raw, err := json.Marshal(cfg.Services)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"filter":null`) {
+		t.Fatalf("JSON lost explicit filter clear: %s", raw)
+	}
 }
 
 func TestValidateConfigRejectsMissingName(t *testing.T) {

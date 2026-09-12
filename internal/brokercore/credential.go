@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"sort"
 	"time"
 
 	"github.com/Infisical/agent-vault/internal/broker"
@@ -47,6 +48,103 @@ type CredentialMatch struct {
 
 	service *broker.Service
 	vaultID string
+}
+
+// CredentialMatchSnapshotVersion is the only frozen-match wire format this
+// release understands. Unknown versions are rejected rather than re-running
+// the mutable service matcher.
+const CredentialMatchSnapshotVersion = 1
+
+// CredentialMatchSnapshot is the non-secret, durable representation of a
+// CredentialMatch stored with a filter continuation. Auth fields contain
+// credential key names and header templates, never resolved values.
+type CredentialMatchSnapshot struct {
+	Version        int                   `json:"version"`
+	VaultID        string                `json:"vault_id"`
+	MatchedName    string                `json:"matched_name"`
+	MatchedHost    string                `json:"matched_host"`
+	MatchedPath    string                `json:"matched_path,omitempty"`
+	MatchedPort    *int                  `json:"matched_port,omitempty"`
+	Auth           broker.Auth           `json:"auth"`
+	Substitutions  []broker.Substitution `json:"substitutions,omitempty"`
+	CredentialKeys []string              `json:"credential_keys,omitempty"`
+	Passthrough    bool                  `json:"passthrough,omitempty"`
+}
+
+// Freeze serializes a match without its filter configuration or credential
+// values. The result can be restored on another replica.
+func (m *CredentialMatch) Freeze() ([]byte, error) {
+	if m == nil || m.vaultID == "" {
+		return nil, ErrServiceNotFound
+	}
+	snapshot := CredentialMatchSnapshot{
+		Version:        CredentialMatchSnapshotVersion,
+		VaultID:        m.vaultID,
+		MatchedName:    m.MatchedName,
+		MatchedHost:    m.MatchedHost,
+		MatchedPath:    m.MatchedPath,
+		MatchedPort:    m.MatchedPort,
+		CredentialKeys: sortedCredentialKeys(m.CredentialKeys),
+		Passthrough:    m.Passthrough,
+	}
+	if m.service != nil {
+		snapshot.Auth = m.service.Auth
+		snapshot.Substitutions = append([]broker.Substitution(nil), m.service.Substitutions...)
+	}
+	return json.Marshal(snapshot)
+}
+
+// RestoreCredentialMatch reconstructs an immutable match from a shared-store
+// snapshot. It never consults current broker configuration.
+func RestoreCredentialMatch(raw []byte) (*CredentialMatch, error) {
+	var snapshot CredentialMatchSnapshot
+	if len(raw) == 0 || json.Unmarshal(raw, &snapshot) != nil ||
+		snapshot.Version != CredentialMatchSnapshotVersion || snapshot.VaultID == "" {
+		return nil, ErrServiceNotFound
+	}
+	if snapshot.MatchedName == "" || snapshot.MatchedHost == "" {
+		return nil, ErrServiceNotFound
+	}
+	if snapshot.Passthrough != (snapshot.Auth.Type == "passthrough") {
+		return nil, ErrServiceNotFound
+	}
+	service := &broker.Service{
+		Name:          snapshot.MatchedName,
+		Host:          snapshot.MatchedHost,
+		Path:          snapshot.MatchedPath,
+		Port:          snapshot.MatchedPort,
+		Auth:          snapshot.Auth,
+		Substitutions: append([]broker.Substitution(nil), snapshot.Substitutions...),
+	}
+	if err := broker.Validate(&broker.Config{Vault: snapshot.VaultID, Services: []broker.Service{*service}}); err != nil {
+		return nil, ErrServiceNotFound
+	}
+	keys := sortedCredentialKeys(service.CredentialKeys())
+	snapshot.CredentialKeys = sortedCredentialKeys(snapshot.CredentialKeys)
+	if len(keys) != len(snapshot.CredentialKeys) {
+		return nil, ErrServiceNotFound
+	}
+	for i := range keys {
+		if keys[i] != snapshot.CredentialKeys[i] {
+			return nil, ErrServiceNotFound
+		}
+	}
+	return &CredentialMatch{
+		MatchedName:    snapshot.MatchedName,
+		MatchedHost:    snapshot.MatchedHost,
+		MatchedPath:    snapshot.MatchedPath,
+		MatchedPort:    snapshot.MatchedPort,
+		CredentialKeys: append([]string(nil), keys...),
+		Passthrough:    snapshot.Passthrough,
+		service:        service,
+		vaultID:        snapshot.VaultID,
+	}, nil
+}
+
+func sortedCredentialKeys(keys []string) []string {
+	keys = append([]string(nil), keys...)
+	sort.Strings(keys)
+	return keys
 }
 
 // InjectResult is the outcome of resolving a CredentialMatch to ready-to-attach

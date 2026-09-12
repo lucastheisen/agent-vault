@@ -96,6 +96,22 @@ func TestResolveForProxy_ScopedSession_MatchingHint(t *testing.T) {
 	}
 }
 
+func TestResolveForProxy_ScopedTokenCarriesCreatorAndSessionHash(t *testing.T) {
+	f := newFakeSessionStore()
+	f.putVault("v1", "default")
+	f.sessions["tok"] = &store.Session{
+		VaultID: "v1", VaultRole: "proxy",
+		CreatedByActorID: "creator-agent", CreatedByActorType: ActorTypeAgent,
+	}
+	scope, err := NewStoreSessionResolver(f).ResolveForProxy(context.Background(), "tok", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scope.AgentID != "creator-agent" || scope.UserID != "" || scope.SourceSessionHash != HashOpaqueToken("tok") {
+		t.Fatalf("scope = %+v", scope)
+	}
+}
+
 func TestResolveForProxy_ScopedSession_MismatchedHint(t *testing.T) {
 	f := newFakeSessionStore()
 	f.putVault("v1", "default")

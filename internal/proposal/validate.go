@@ -47,7 +47,7 @@ func Validate(services []Service, credentials []CredentialSlot) error {
 		if s.Action != ActionSet && s.Action != ActionDelete {
 			return fmt.Errorf("service %d: invalid action %q (must be %q or %q)", i, s.Action, ActionSet, ActionDelete)
 		}
-		if s.Filter != nil {
+		if s.FilterSpecified() {
 			return fmt.Errorf("service %d: filter is admin-configured and cannot be proposed", i)
 		}
 		if s.Host == "" {

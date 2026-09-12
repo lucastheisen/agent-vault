@@ -18,6 +18,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/Infisical/agent-vault/internal/auth"
+	"github.com/Infisical/agent-vault/internal/broker"
 	"github.com/Infisical/agent-vault/internal/brokercore"
 	"github.com/Infisical/agent-vault/internal/crypto"
 	"github.com/Infisical/agent-vault/internal/infisical"
@@ -6006,6 +6007,151 @@ func TestServicesUpsertFilterRequiresPolicyVaultAdmin(t *testing.T) {
 	})
 	t.Run("accepts when caller administers both vaults", func(t *testing.T) {
 		tester(t, true, true, http.StatusOK)
+	})
+}
+
+func TestServicesUpsertFilterAllowsSameVaultAndOmittedPolicyVault(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		filter string
+	}{
+		{name: "same vault", filter: `{"url":"https://policy.example.com/check","policy_vault":"default"}`},
+		{name: "no policy capability", filter: `{"url":"https://policy.example.com/check"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ms, token := setupMockStoreWithSession(t)
+			srv := newTestServer(withStore(ms))
+			body := fmt.Sprintf(`{"services":[{"name":"filtered-api","host":"api.example.com","auth":{"type":"passthrough"},"filter":%s}]}`, tc.filter)
+			req := httptest.NewRequest(http.MethodPost, "/v1/vaults/default/services", strings.NewReader(body))
+			req.Header.Set("Authorization", "Bearer "+token)
+			rec := httptest.NewRecorder()
+			srv.httpServer.Handler.ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestServicesUpsertFilterOmitPreservesAndNullClears(t *testing.T) {
+	tester := func(t *testing.T, filterField string, wantFilter bool) {
+		t.Helper()
+		ms, token := setupMockStoreWithSession(t)
+		ms.brokerConfigs["root-ns-id"] = &store.BrokerConfig{
+			VaultID:      "root-ns-id",
+			ServicesJSON: `[{"name":"filtered-api","host":"api.example.com","auth":{"type":"passthrough"},"filter":{"url":"https://policy.example.com/check"}}]`,
+		}
+		srv := newTestServer(withStore(ms))
+		body := fmt.Sprintf(`{"services":[{"name":"filtered-api","host":"api.example.com","auth":{"type":"passthrough"}%s}]}`, filterField)
+		req := httptest.NewRequest(http.MethodPost, "/v1/vaults/default/services", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+		srv.httpServer.Handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+		}
+		var services []broker.Service
+		if err := json.Unmarshal([]byte(ms.brokerConfigs["root-ns-id"].ServicesJSON), &services); err != nil {
+			t.Fatalf("unmarshal stored services: %v", err)
+		}
+		if (services[0].Filter != nil) != wantFilter {
+			t.Fatalf("filter present = %v, want %v; stored=%s", services[0].Filter != nil, wantFilter, ms.brokerConfigs["root-ns-id"].ServicesJSON)
+		}
+	}
+
+	t.Run("omitted preserves", func(t *testing.T) { tester(t, "", true) })
+	t.Run("explicit null clears", func(t *testing.T) { tester(t, `,"filter":null`, false) })
+}
+
+func TestServicesGetFilterRoundTripFields(t *testing.T) {
+	ms, token := setupMockStoreWithSession(t)
+	ms.brokerConfigs["root-ns-id"] = &store.BrokerConfig{
+		VaultID:      "root-ns-id",
+		ServicesJSON: `[{"name":"filtered-api","host":"api.example.com","auth":{"type":"passthrough"},"filter":{"url":"http://filter:23875/check","policy_vault":"default","allow_insecure_private_http":true}}]`,
+	}
+	srv := newTestServer(withStore(ms))
+	req := httptest.NewRequest(http.MethodGet, "/v1/vaults/default/services", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	for _, field := range []string{`"url":"http://filter:23875/check"`, `"policy_vault":"default"`, `"allow_insecure_private_http":true`} {
+		if !strings.Contains(rec.Body.String(), field) {
+			t.Fatalf("GET response missing %s: %s", field, rec.Body.String())
+		}
+	}
+}
+
+func TestServicesSetAndClearDoNotPreserveFilters(t *testing.T) {
+	t.Run("set replaces complete list", func(t *testing.T) {
+		ms, token := setupMockStoreWithSession(t)
+		ms.brokerConfigs["root-ns-id"] = &store.BrokerConfig{
+			VaultID:      "root-ns-id",
+			ServicesJSON: `[{"name":"filtered-api","host":"api.example.com","auth":{"type":"passthrough"},"filter":{"url":"https://policy.example.com/check"}}]`,
+		}
+		srv := newTestServer(withStore(ms))
+		body := `{"services":[{"name":"filtered-api","host":"api.example.com","auth":{"type":"passthrough"}}]}`
+		req := httptest.NewRequest(http.MethodPut, "/v1/vaults/default/services", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+		srv.httpServer.Handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+		}
+		if strings.Contains(ms.brokerConfigs["root-ns-id"].ServicesJSON, `"filter"`) {
+			t.Fatalf("PUT unexpectedly preserved filter: %s", ms.brokerConfigs["root-ns-id"].ServicesJSON)
+		}
+	})
+
+	t.Run("clear removes filtered services", func(t *testing.T) {
+		ms, token := setupMockStoreWithSession(t)
+		ms.brokerConfigs["root-ns-id"] = &store.BrokerConfig{
+			VaultID:      "root-ns-id",
+			ServicesJSON: `[{"name":"filtered-api","host":"api.example.com","auth":{"type":"passthrough"},"filter":{"url":"https://policy.example.com/check"}}]`,
+		}
+		srv := newTestServer(withStore(ms))
+		req := httptest.NewRequest(http.MethodDelete, "/v1/vaults/default/services", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+		srv.httpServer.Handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+		}
+		if got := ms.brokerConfigs["root-ns-id"].ServicesJSON; got != "[]" {
+			t.Fatalf("expected empty service list, got %s", got)
+		}
+	})
+}
+
+func TestProposalCreateRejectsFilterNullAndFilteredDelete(t *testing.T) {
+	t.Run("explicit null", func(t *testing.T) {
+		srv, _, token := setupProposalTest(t)
+		body := `{"services":[{"action":"set","name":"filtered-api","host":"api.example.com","auth":{"type":"passthrough"},"filter":null}]}`
+		req := httptest.NewRequest(http.MethodPost, "/v1/proposals", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+		srv.httpServer.Handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "admin-configured") {
+			t.Fatalf("expected admin-configured 400, got %d: %s", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("delete filtered service", func(t *testing.T) {
+		srv, ms, token := setupProposalTest(t)
+		ms.brokerConfigs["root-ns-id"] = &store.BrokerConfig{
+			VaultID:      "root-ns-id",
+			ServicesJSON: `[{"name":"filtered-api","host":"api.example.com","auth":{"type":"passthrough"},"filter":{"url":"https://policy.example.com/check"}}]`,
+		}
+		body := `{"services":[{"action":"delete","name":"filtered-api","host":"api.example.com"}]}`
+		req := httptest.NewRequest(http.MethodPost, "/v1/proposals", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+		srv.httpServer.Handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "cannot be deleted") {
+			t.Fatalf("expected filtered-delete 400, got %d: %s", rec.Code, rec.Body.String())
+		}
 	})
 }
 

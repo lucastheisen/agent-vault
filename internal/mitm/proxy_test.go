@@ -19,6 +19,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -499,6 +500,93 @@ func TestMITMWebSocketInjectsCredentialsAndPipesFrames(t *testing.T) {
 	}
 	if len(sawKeyValues) != 1 {
 		t.Fatalf("upstream Sec-WebSocket-Key values = %v, want exactly one", sawKeyValues)
+	}
+}
+
+func TestMITMFilteredWebSocketProxiesUpgradeAndFramesToSidecar(t *testing.T) {
+	var upstreamHits atomic.Int32
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		upstreamHits.Add(1)
+	}))
+	defer upstream.Close()
+
+	var sawOriginal, sawContinuation, sawCredential string
+	sidecarDone := make(chan error, 1)
+	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawOriginal = r.Header.Get(filterTargetURLHeader)
+		sawContinuation = r.Header.Get(filterContinuationTokenHeader)
+		sawCredential = r.Header.Get("Authorization")
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			sidecarDone <- fmt.Errorf("sidecar response writer cannot hijack")
+			return
+		}
+		conn, rw, err := hj.Hijack()
+		if err != nil {
+			sidecarDone <- err
+			return
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+		_, _ = fmt.Fprintf(conn,
+			"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n",
+			websocketAccept(r.Header.Get("Sec-Websocket-Key")))
+		text, err := readWebSocketTextFrame(rw.Reader)
+		if err == nil && text != "filter-ping" {
+			err = fmt.Errorf("sidecar frame = %q", text)
+		}
+		if err == nil {
+			err = writeWebSocketTextFrame(conn, "filter-pong", false)
+		}
+		sidecarDone <- err
+	}))
+	defer sidecar.Close()
+
+	upstreamTarget := strings.TrimPrefix(upstream.URL, "https://")
+	upstreamHost, _, _ := net.SplitHostPort(upstreamTarget)
+	sr := validTokenResolver("av_sess_ok", &brokercore.ProxyScope{VaultID: "v1", VaultName: "default", VaultRole: "proxy"})
+	cp := &fakeCredProvider{byHost: map[string]fakeInjectResult{
+		upstreamHost: {
+			filter: &broker.Filter{URL: sidecar.URL},
+			result: &brokercore.InjectResult{Headers: map[string]string{"Authorization": "Bearer must-not-reach-filter"}, MatchedName: "ws-filter"},
+		},
+	}}
+	proxyURL, roots, _ := setupProxy(t, sr, cp)
+	conn := openMITMTunnel(t, proxyURL, roots, upstreamTarget, "av_sess_ok")
+	defer conn.Close()
+	tlsConn := tls.Client(conn, &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots, ServerName: upstreamHost})
+	if err := tlsConn.Handshake(); err != nil {
+		t.Fatal(err)
+	}
+	defer tlsConn.Close()
+	_ = tlsConn.SetDeadline(time.Now().Add(5 * time.Second))
+	key := "dGhlIHNhbXBsZSBub25jZQ=="
+	_, _ = fmt.Fprintf(tlsConn,
+		"GET /filtered/socket?mode=test HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\nAuthorization: Bearer client-value\r\n\r\n",
+		upstreamTarget, key)
+	reader := bufio.NewReader(tlsConn)
+	resp, err := http.ReadResponse(reader, &http.Request{Method: http.MethodGet})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("status = %d, want 101", resp.StatusCode)
+	}
+	if err := writeWebSocketTextFrame(tlsConn, "filter-ping", true); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := readWebSocketTextFrame(reader); err != nil || got != "filter-pong" {
+		t.Fatalf("filtered websocket reply = %q, %v", got, err)
+	}
+	if err := <-sidecarDone; err != nil {
+		t.Fatal(err)
+	}
+	if upstreamHits.Load() != 0 || cp.ResolveCalls() != 0 {
+		t.Fatalf("origin hits=%d credential resolves=%d before continuation", upstreamHits.Load(), cp.ResolveCalls())
+	}
+	if sawCredential != "Bearer client-value" || sawContinuation == "" || sawOriginal != upstream.URL+"/filtered/socket?mode=test" {
+		t.Fatalf("sidecar credential=%q continuation=%t original=%q", sawCredential, sawContinuation != "", sawOriginal)
 	}
 }
 

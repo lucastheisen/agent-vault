@@ -214,6 +214,13 @@ func (p *Proxy) forwardRequest(
 		emit(http.StatusForbidden, "filter_policy_expired")
 		return
 	}
+	if scope.FilterPolicy && scope.FilterPolicyCapability != "" && p.filterCapabilityStore != nil {
+		if _, err := p.filterCapabilityStore.ValidateFilterPolicyCapability(r.Context(), scope.FilterPolicyCapability, time.Now()); err != nil {
+			brokercore.WriteProxyError(w, http.StatusForbidden, "filter_policy_expired", "filter policy capability is no longer authorized")
+			emit(http.StatusForbidden, "filter_policy_expired")
+			return
+		}
+	}
 
 	release := func() {}
 	if scope.FilterContinuation == "" {
@@ -251,7 +258,7 @@ func (p *Proxy) forwardRequest(
 	var err error
 	if scope.FilterContinuation != "" {
 		var allowed bool
-		match, allowed = p.consumeFilterContinuation(scope, filterRequest{
+		match, allowed = p.consumeFilterContinuation(r.Context(), scope, filterRequest{
 			method: r.Method,
 			path:   r.URL.EscapedPath(),
 			query:  r.URL.RawQuery,
@@ -287,11 +294,6 @@ func (p *Proxy) forwardRequest(
 		return
 	}
 	if match.Filter != nil && scope.FilterContinuation == "" {
-		if isWebSocketUpgrade(r) {
-			http.Error(w, "policy filters do not support websocket upgrades", http.StatusNotImplemented)
-			emit(http.StatusNotImplemented, "filter_websocket_unsupported")
-			return
-		}
 		status, errCode := p.forwardToFilter(w, r, target, scheme, scope, match)
 		emit(status, errCode)
 		return

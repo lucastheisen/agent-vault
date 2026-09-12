@@ -44,8 +44,9 @@ func splitInlineHosts(in []broker.Service) []broker.Service {
 }
 
 // requireFilterPolicyVaultAdmins verifies the cross-vault delegation created
-// by each filter. Admin rights on the source vault alone must never be enough
-// to turn another vault into a credential oracle.
+// by each filter. A same-vault policy capability needs only the source-vault
+// admin check already performed by the caller; a different policy vault needs
+// admin rights on both vaults.
 func (s *Server) requireFilterPolicyVaultAdmins(w http.ResponseWriter, r *http.Request, sourceVaultID string, services []broker.Service) error {
 	checked := make(map[string]bool)
 	for _, service := range services {
@@ -60,11 +61,41 @@ func (s *Server) requireFilterPolicyVaultAdmins(w http.ResponseWriter, r *http.R
 			return fmt.Errorf("filter policy vault %q not found", service.Filter.PolicyVault)
 		}
 		if policyVault.ID == sourceVaultID {
-			jsonError(w, http.StatusBadRequest, "Filter policy vault must be separate from the source vault")
-			return fmt.Errorf("filter policy vault matches source vault")
+			continue
 		}
 		if _, err := s.requireVaultAdmin(w, r, policyVault.ID); err != nil {
 			return fmt.Errorf("filter policy vault %q requires admin access: %w", service.Filter.PolicyVault, err)
+		}
+	}
+	return nil
+}
+
+// serviceFilterFields reports whether each service object explicitly contains
+// a filter field. json.Unmarshal maps both omission and explicit null to a nil
+// *broker.Filter, while POST upsert assigns those forms different meanings:
+// omission preserves an existing filter and null clears it.
+func serviceFilterFields(raw json.RawMessage) ([]bool, error) {
+	var entries []map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &entries); err != nil {
+		return nil, err
+	}
+	present := make([]bool, len(entries))
+	for i, entry := range entries {
+		_, present[i] = entry["filter"]
+	}
+	return present, nil
+}
+
+// rejectFilteredServiceDeletes prevents agent proposals from removing an
+// admin-configured filter by deleting its containing service.
+func rejectFilteredServiceDeletes(existing []broker.Service, proposed []proposal.Service) error {
+	byName := make(map[string]broker.Service, len(existing))
+	for _, service := range existing {
+		byName[service.Name] = service
+	}
+	for _, change := range proposed {
+		if change.Action == proposal.ActionDelete && byName[change.Name].Filter != nil {
+			return fmt.Errorf("service %q has an admin-configured filter and cannot be deleted by proposal", change.Name)
 		}
 	}
 	return nil
@@ -404,6 +435,11 @@ func (s *Server) handleServicesUpsert(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, "At least one service is required")
 		return
 	}
+	filterFields, err := serviceFilterFields(raw.Services)
+	if err != nil || len(filterFields) != len(req.Services) {
+		jsonError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
 
 	// The store serializes statements but not the load → validate → save
 	// sequence; without this lock concurrent upserts can both pass the
@@ -442,8 +478,11 @@ func (s *Server) handleServicesUpsert(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var upserted []string
-	for _, svc := range incomingSlice {
+	for i, svc := range incomingSlice {
 		if idx, ok := byName[svc.Name]; ok {
+			if !filterFields[i] {
+				svc.Filter = existing[idx].Filter
+			}
 			existing[idx] = svc
 		} else {
 			byName[svc.Name] = len(existing)

@@ -2,6 +2,8 @@ package brokercore
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"time"
 
 	"github.com/Infisical/agent-vault/internal/store"
@@ -26,6 +28,9 @@ type ProxyScope struct {
 	VaultID   string
 	VaultName string
 	VaultRole string
+	// SourceSessionHash identifies the source session without retaining its raw
+	// bearer. Filter capabilities use it for immediate revocation checks.
+	SourceSessionHash string
 
 	// FilterPolicy marks a short-lived session issued to a policy filter. It
 	// may use ordinary services in its policy vault but cannot invoke another
@@ -34,11 +39,21 @@ type ProxyScope struct {
 	// FilterPolicyExpiresAt keeps the short lifetime enforceable for every
 	// request on a persistent CONNECT tunnel, not only at tunnel creation.
 	FilterPolicyExpiresAt time.Time
+	// FilterPolicyCapability is retained only in memory so persistent CONNECT
+	// tunnels can revalidate the shared row and source authority per request.
+	FilterPolicyCapability string
 
 	// FilterContinuation is set only on the private scope created for a
 	// policy-filter continuation. The proxy validates and consumes it against
 	// the exact original request before resolving a destination credential.
 	FilterContinuation string
+}
+
+// HashOpaqueToken returns the one-way identifier used for session and filter
+// capability rows. Raw bearer material must never be persisted.
+func HashOpaqueToken(raw string) string {
+	h := sha256.Sum256([]byte(raw))
+	return hex.EncodeToString(h[:])
 }
 
 // ActorID returns the non-empty principal ID — UserID for user
@@ -99,6 +114,7 @@ func (r *StoreSessionResolver) ResolveForProxy(ctx context.Context, token, vault
 	if sess.IsExpired(now()) {
 		return nil, ErrInvalidSession
 	}
+	sessionHash := HashOpaqueToken(token)
 
 	// Scoped session: vault is baked into the session. A hint must match
 	// the session's vault name; never silently retarget.
@@ -110,12 +126,22 @@ func (r *StoreSessionResolver) ResolveForProxy(ctx context.Context, token, vault
 		if vaultHint != "" && vaultHint != v.Name {
 			return nil, ErrVaultHintMismatch
 		}
+		sourceUserID, sourceAgentID := sess.UserID, sess.AgentID
+		if sourceUserID == "" && sourceAgentID == "" {
+			switch sess.CreatedByActorType {
+			case ActorTypeUser:
+				sourceUserID = sess.CreatedByActorID
+			case ActorTypeAgent:
+				sourceAgentID = sess.CreatedByActorID
+			}
+		}
 		return &ProxyScope{
-			UserID:    sess.UserID,
-			AgentID:   sess.AgentID,
-			VaultID:   v.ID,
-			VaultName: v.Name,
-			VaultRole: sess.VaultRole,
+			UserID:            sourceUserID,
+			AgentID:           sourceAgentID,
+			VaultID:           v.ID,
+			VaultName:         v.Name,
+			VaultRole:         sess.VaultRole,
+			SourceSessionHash: sessionHash,
 		}, nil
 	}
 
@@ -135,10 +161,11 @@ func (r *StoreSessionResolver) ResolveForProxy(ctx context.Context, token, vault
 			return nil, ErrVaultAccessDenied
 		}
 		return &ProxyScope{
-			AgentID:   sess.AgentID,
-			VaultID:   v.ID,
-			VaultName: v.Name,
-			VaultRole: role,
+			AgentID:           sess.AgentID,
+			VaultID:           v.ID,
+			VaultName:         v.Name,
+			VaultRole:         role,
+			SourceSessionHash: sessionHash,
 		}, nil
 	}
 
@@ -152,10 +179,11 @@ func (r *StoreSessionResolver) ResolveForProxy(ctx context.Context, token, vault
 	case 1:
 		g := grants[0]
 		return &ProxyScope{
-			AgentID:   sess.AgentID,
-			VaultID:   g.VaultID,
-			VaultName: g.VaultName,
-			VaultRole: g.Role,
+			AgentID:           sess.AgentID,
+			VaultID:           g.VaultID,
+			VaultName:         g.VaultName,
+			VaultRole:         g.Role,
+			SourceSessionHash: sessionHash,
 		}, nil
 	default:
 		return nil, ErrAgentVaultAmbiguous

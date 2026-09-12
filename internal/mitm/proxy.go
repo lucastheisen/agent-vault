@@ -29,6 +29,7 @@ package mitm
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -53,7 +54,9 @@ type Proxy struct {
 	httpServer               *http.Server
 	upstream                 *http.Transport
 	filterUpstream           *http.Transport
+	filterPrivateUpstream    *http.Transport
 	filterCaps               *filterCapabilities
+	filterCapabilityStore    FilterCapabilityStore
 	policyVault              PolicyVaultResolver
 	advertisedFilterProxyURL *url.URL
 	listenerMu               sync.RWMutex
@@ -90,6 +93,9 @@ type Options struct {
 	// to filters. Nil advertises this listener on 127.0.0.1, which is suitable
 	// only for a filter running on the same host.
 	FilterProxyURL *url.URL
+	// FilterCapabilities enables the production shared capability backend.
+	// Nil uses the single-process in-memory backend intended for tests/dev.
+	FilterCapabilities FilterCapabilityStore
 }
 
 // New builds a Proxy bound to addr. The returned Proxy does not begin
@@ -104,28 +110,8 @@ func New(addr string, opts Options) *Proxy {
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: 5 * time.Minute,
 	}
-	safeFilterDial := netguard.SafeDialContext(netguard.AllowPrivateFromEnv())
-	directDial := (&net.Dialer{}).DialContext
-	filterUpstream := &http.Transport{
-		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
-			host, _, err := net.SplitHostPort(address)
-			if err == nil {
-				if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
-					// A literal loopback filter is an explicit admin choice and is
-					// safe from DNS rebinding. Other private destinations retain
-					// the normal netguard policy.
-					return directDial(ctx, network, address)
-				}
-			}
-			return safeFilterDial(ctx, network, address)
-		},
-		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
-		ForceAttemptHTTP2:     false,
-		MaxIdleConns:          100,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 5 * time.Minute,
-	}
+	filterUpstream := newFilterTransport(false)
+	filterPrivateUpstream := newFilterTransport(true)
 
 	sink := opts.LogSink
 	if sink == nil {
@@ -143,7 +129,9 @@ func New(addr string, opts Options) *Proxy {
 		creds:                    opts.Credentials,
 		upstream:                 upstream,
 		filterUpstream:           filterUpstream,
+		filterPrivateUpstream:    filterPrivateUpstream,
 		filterCaps:               newFilterCapabilities(),
+		filterCapabilityStore:    opts.FilterCapabilities,
 		policyVault:              opts.PolicyVault,
 		advertisedFilterProxyURL: opts.FilterProxyURL,
 		baseURL:                  opts.BaseURL,
@@ -159,6 +147,67 @@ func New(addr string, opts Options) *Proxy {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	return p
+}
+
+// newFilterTransport builds the dedicated sidecar dial policy. HTTPS filters
+// use privateOnly=false (public and private destinations are allowed, while
+// link-local/unspecified addresses are always blocked). Cleartext HTTP uses
+// privateOnly=true and can dial only loopback/RFC1918 addresses. Hostnames are
+// resolved and every answer is checked on every connection.
+func newFilterTransport(privateOnly bool) *http.Transport {
+	dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+	return &http.Transport{
+		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(address)
+			if err != nil {
+				return nil, fmt.Errorf("filter dial address: %w", err)
+			}
+			var addresses []net.IPAddr
+			if ip := net.ParseIP(host); ip != nil {
+				addresses = []net.IPAddr{{IP: ip}}
+			} else {
+				addresses, err = net.DefaultResolver.LookupIPAddr(ctx, host)
+				if err != nil {
+					return nil, err
+				}
+			}
+			if len(addresses) == 0 {
+				return nil, fmt.Errorf("filter host %q resolved to no addresses", host)
+			}
+			for _, resolved := range addresses {
+				ip := resolved.IP
+				if ip == nil || ip.IsUnspecified() || ip.IsMulticast() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+					(privateOnly && !ip.IsLoopback() && !isRFC1918Address(ip)) {
+					return nil, fmt.Errorf("filter host %q resolves to blocked address %s", host, ip)
+				}
+			}
+			var lastErr error
+			for _, resolved := range addresses {
+				conn, dialErr := dialer.DialContext(ctx, network, net.JoinHostPort(resolved.IP.String(), port))
+				if dialErr == nil {
+					return conn, nil
+				}
+				lastErr = dialErr
+			}
+			return nil, lastErr
+		},
+		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
+		ForceAttemptHTTP2:     false,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 5 * time.Minute,
+	}
+}
+
+func isRFC1918Address(ip net.IP) bool {
+	ip = ip.To4()
+	if ip == nil {
+		return false
+	}
+	return ip[0] == 10 ||
+		(ip[0] == 172 && ip[1] >= 16 && ip[1] <= 31) ||
+		(ip[0] == 192 && ip[1] == 168)
 }
 
 // Addr returns the listener address the Proxy was configured with.
@@ -210,6 +259,7 @@ func (p *Proxy) Serve(l net.Listener) error {
 func (p *Proxy) Shutdown(ctx context.Context) error {
 	p.upstream.CloseIdleConnections()
 	p.filterUpstream.CloseIdleConnections()
+	p.filterPrivateUpstream.CloseIdleConnections()
 	return p.httpServer.Shutdown(ctx)
 }
 

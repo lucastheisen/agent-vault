@@ -1396,7 +1396,13 @@ func (s *SQLStore) GrantVaultRole(ctx context.Context, actorID, actorType, vault
 }
 
 func (s *SQLStore) RevokeVaultAccess(ctx context.Context, actorID, vaultID string) error {
-	res, err := s.db.ExecContext(ctx,
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("revoking vault access: begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	res, err := tx.ExecContext(ctx,
 		s.dialect.Rebind("DELETE FROM vault_grants WHERE actor_id = ? AND vault_id = ?"),
 		actorID, vaultID,
 	)
@@ -1406,6 +1412,20 @@ func (s *SQLStore) RevokeVaultAccess(ctx context.Context, actorID, vaultID strin
 	n, _ := res.RowsAffected()
 	if n == 0 {
 		return sql.ErrNoRows
+	}
+	// A remove-and-regrant during the capability's 30-second TTL must not
+	// revive authority minted before the removal. Burn the actor's outstanding
+	// capabilities in the same transaction as the grant revocation.
+	if _, err := tx.ExecContext(ctx,
+		s.dialect.Rebind(`UPDATE filter_capabilities
+		 SET state = 'consumed', consumed_at = ?
+		 WHERE source_actor_id = ? AND source_vault_id = ? AND state <> 'consumed'`),
+		s.now(), actorID, vaultID,
+	); err != nil {
+		return fmt.Errorf("revoking vault access: invalidating filter capabilities: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("revoking vault access: commit: %w", err)
 	}
 	return nil
 }

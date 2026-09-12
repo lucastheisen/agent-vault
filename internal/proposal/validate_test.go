@@ -1,6 +1,7 @@
 package proposal
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -61,6 +62,17 @@ func TestValidateRejectsAdminConfiguredFilter(t *testing.T) {
 	err := Validate(services, nil)
 	if err == nil || !strings.Contains(err.Error(), "admin-configured") {
 		t.Fatalf("expected admin-configured filter error, got %v", err)
+	}
+}
+
+func TestValidateRejectsExplicitNullFilter(t *testing.T) {
+	var services []Service
+	if err := json.Unmarshal([]byte(`[{"action":"set","name":"gitlab-push","host":"gitlab.example.com","auth":{"type":"passthrough"},"filter":null}]`), &services); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	err := Validate(services, nil)
+	if err == nil || !strings.Contains(err.Error(), "admin-configured") {
+		t.Fatalf("expected explicit null filter to be rejected, got %v", err)
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -14,15 +15,19 @@ import (
 	"time"
 
 	"github.com/Infisical/agent-vault/internal/brokercore"
+	"github.com/Infisical/agent-vault/internal/store"
 )
 
 const (
 	filterCapabilityTTL = 30 * time.Second
 
-	filterContinuationProxyHeader = "X-Agent-Vault-Continuation-Proxy"
-	filterCAHeader                = "X-Agent-Vault-CA"
-	filterPolicyProxyHeader       = "X-Agent-Vault-Policy-Proxy"
-	filterTargetURLHeader         = "X-Agent-Vault-Target-URL"
+	filterContinuationProxyHeader = brokercore.HeaderFilterContinuationProxy
+	filterContinuationTokenHeader = brokercore.HeaderFilterContinuationToken
+	filterCAHeader                = brokercore.HeaderFilterCA
+	filterPolicyProxyHeader       = brokercore.HeaderFilterPolicyProxy
+	filterPolicyTokenHeader       = brokercore.HeaderFilterPolicyToken
+	filterTargetURLHeader         = brokercore.HeaderFilterOriginalURL
+	filterServiceHeader           = brokercore.HeaderFilterService
 )
 
 type filterCapabilityKind uint8
@@ -42,6 +47,17 @@ const (
 // PolicyVaultResolver resolves a configured policy-vault name into the
 // non-secret proxy scope that a filter receives for its policy checks.
 type PolicyVaultResolver func(context.Context, string, *brokercore.ProxyScope) (*brokercore.ProxyScope, error)
+
+// FilterCapabilityStore is the narrow shared-store surface required by the
+// proxy. store.Store satisfies it. A nil store selects the test-only
+// single-process backend below; production wiring always supplies the shared
+// database store.
+type FilterCapabilityStore interface {
+	CreateFilterCapability(context.Context, *store.FilterCapability) (string, error)
+	ResolveFilterCapability(context.Context, string, string, time.Time) (*store.FilterCapability, error)
+	ConsumeFilterContinuation(context.Context, string, store.FilterRequestBinding, time.Time) (*store.FilterCapability, error)
+	ValidateFilterPolicyCapability(context.Context, string, time.Time) (*store.FilterCapability, error)
+}
 
 type filterCapabilities struct {
 	capabilities map[string]filterCapability
@@ -192,14 +208,26 @@ func (c *filterCapabilities) resolve(token, target string) (*brokercore.ProxySco
 	return &scope, true, nil
 }
 
-func (p *Proxy) consumeFilterContinuation(scope *brokercore.ProxyScope, request filterRequest) (*brokercore.CredentialMatch, bool) {
+func (p *Proxy) consumeFilterContinuation(ctx context.Context, scope *brokercore.ProxyScope, request filterRequest) (*brokercore.CredentialMatch, bool) {
 	if scope.FilterContinuation == "" {
 		return nil, true
+	}
+	if p.filterCapabilityStore != nil {
+		capability, err := p.filterCapabilityStore.ConsumeFilterContinuation(ctx, scope.FilterContinuation, request.storeBinding(), time.Now())
+		if err != nil || capability == nil || capability.SnapshotVersion != brokercore.CredentialMatchSnapshotVersion {
+			return nil, false
+		}
+		match, err := brokercore.RestoreCredentialMatch(capability.SnapshotJSON)
+		return match, err == nil
 	}
 	return p.filterCaps.consume(scope.FilterContinuation, request)
 }
 
-func (p *Proxy) filterProxyURL(token string) (string, error) {
+func (r filterRequest) storeBinding() store.FilterRequestBinding {
+	return store.FilterRequestBinding{Method: r.method, Scheme: r.scheme, Authority: r.target, Path: r.path, Query: r.query}
+}
+
+func (p *Proxy) filterProxyURL() (string, error) {
 	var proxyURL *url.URL
 	if p.advertisedFilterProxyURL != nil {
 		copyURL := *p.advertisedFilterProxyURL
@@ -217,8 +245,50 @@ func (p *Proxy) filterProxyURL(token string) (string, error) {
 		}
 		proxyURL = &url.URL{Scheme: "http", Host: net.JoinHostPort("127.0.0.1", port)}
 	}
-	proxyURL.User = url.User(token)
+	proxyURL.User = nil
 	return proxyURL.String(), nil
+}
+
+func (p *Proxy) issueFilterCapability(
+	ctx context.Context,
+	kind filterCapabilityKind,
+	source, target *brokercore.ProxyScope,
+	request filterRequest,
+	match *brokercore.CredentialMatch,
+) (string, error) {
+	if p.filterCapabilityStore == nil {
+		return p.filterCaps.issue(kind, target, request, match)
+	}
+	if source == nil || target == nil || source.SourceSessionHash == "" {
+		return "", fmt.Errorf("issue filter capability: source authority is incomplete")
+	}
+	actorType, actorID := actorFromScope(source)
+	if actorType == "" || actorID == "" {
+		return "", fmt.Errorf("issue filter capability: source actor is required")
+	}
+	record := &store.FilterCapability{
+		Kind:              store.FilterCapabilityPolicy,
+		SourceVaultID:     source.VaultID,
+		SourceSessionHash: source.SourceSessionHash,
+		SourceActorID:     actorID,
+		SourceActorType:   actorType,
+		SourceAgentID:     source.AgentID,
+		TargetVaultID:     target.VaultID,
+		TargetVaultName:   target.VaultName,
+		TargetVaultRole:   target.VaultRole,
+		ExpiresAt:         time.Now().Add(filterCapabilityTTL),
+	}
+	if kind == filterCapabilityContinuation {
+		snapshot, err := match.Freeze()
+		if err != nil {
+			return "", fmt.Errorf("freeze credential match: %w", err)
+		}
+		record.Kind = store.FilterCapabilityContinuation
+		record.Request = request.storeBinding()
+		record.SnapshotVersion = brokercore.CredentialMatchSnapshotVersion
+		record.SnapshotJSON = snapshot
+	}
+	return p.filterCapabilityStore.CreateFilterCapability(ctx, record)
 }
 
 func (p *Proxy) forwardToFilter(
@@ -228,14 +298,18 @@ func (p *Proxy) forwardToFilter(
 	scope *brokercore.ProxyScope,
 	match *brokercore.CredentialMatch,
 ) (int, string) {
+	if match.Filter == nil || match.Filter.Validate() != nil {
+		brokercore.WriteProxyError(w, http.StatusBadGateway, "filter_misconfigured", "service filter configuration is invalid")
+		return http.StatusBadGateway, "filter_misconfigured"
+	}
 	filterURL, err := url.Parse(match.Filter.URL)
 	if err != nil {
-		http.Error(w, "bad gateway", http.StatusBadGateway)
-		return http.StatusBadGateway, "filter_config_error"
+		brokercore.WriteProxyError(w, http.StatusBadGateway, "filter_misconfigured", "service filter configuration is invalid")
+		return http.StatusBadGateway, "filter_misconfigured"
 	}
 	if p.advertisedFilterProxyURL == nil && !isLoopbackURL(filterURL) {
-		http.Error(w, "bad gateway", http.StatusBadGateway)
-		return http.StatusBadGateway, "filter_proxy_url_required"
+		brokercore.WriteProxyError(w, http.StatusBadGateway, "filter_misconfigured", "AGENT_VAULT_FILTER_PROXY_URL is required for a remote filter")
+		return http.StatusBadGateway, "filter_misconfigured"
 	}
 
 	original := filterRequest{
@@ -245,52 +319,69 @@ func (p *Proxy) forwardToFilter(
 		scheme: scheme,
 		target: target,
 	}
-	continuationToken, err := p.filterCaps.issue(filterCapabilityContinuation, scope, original, match)
+	continuationToken, err := p.issueFilterCapability(r.Context(), filterCapabilityContinuation, scope, scope, original, match)
 	if err != nil {
-		http.Error(w, "bad gateway", http.StatusBadGateway)
-		return http.StatusBadGateway, "filter_capability_error"
+		brokercore.WriteProxyError(w, http.StatusBadGateway, "filter_misconfigured", "failed to create filter continuation")
+		return http.StatusBadGateway, "filter_misconfigured"
 	}
-	continuationProxy, err := p.filterProxyURL(continuationToken)
+	continuationProxy, err := p.filterProxyURL()
 	if err != nil {
-		http.Error(w, "bad gateway", http.StatusBadGateway)
-		return http.StatusBadGateway, "filter_capability_error"
+		brokercore.WriteProxyError(w, http.StatusBadGateway, "filter_misconfigured", "filter callback proxy is unavailable")
+		return http.StatusBadGateway, "filter_misconfigured"
 	}
 
-	var policyProxy string
+	var policyToken string
 	if match.Filter.PolicyVault != "" {
 		if p.policyVault == nil {
-			http.Error(w, "bad gateway", http.StatusBadGateway)
-			return http.StatusBadGateway, "filter_policy_unavailable"
+			brokercore.WriteProxyError(w, http.StatusBadGateway, "filter_misconfigured", "filter policy vault resolver is unavailable")
+			return http.StatusBadGateway, "filter_misconfigured"
 		}
 		policyScope, err := p.policyVault(r.Context(), match.Filter.PolicyVault, scope)
 		if err != nil || policyScope == nil {
-			http.Error(w, "bad gateway", http.StatusBadGateway)
-			return http.StatusBadGateway, "filter_policy_unavailable"
+			brokercore.WriteProxyError(w, http.StatusBadGateway, "filter_misconfigured", "filter policy vault is unavailable")
+			return http.StatusBadGateway, "filter_misconfigured"
 		}
-		policyToken, err := p.filterCaps.issue(filterCapabilityPolicy, policyScope, filterRequest{}, nil)
+		policyToken, err = p.issueFilterCapability(r.Context(), filterCapabilityPolicy, scope, policyScope, filterRequest{}, nil)
 		if err != nil {
-			http.Error(w, "bad gateway", http.StatusBadGateway)
-			return http.StatusBadGateway, "filter_capability_error"
-		}
-		policyProxy, err = p.filterProxyURL(policyToken)
-		if err != nil {
-			http.Error(w, "bad gateway", http.StatusBadGateway)
-			return http.StatusBadGateway, "filter_capability_error"
+			brokercore.WriteProxyError(w, http.StatusBadGateway, "filter_misconfigured", "failed to create filter policy capability")
+			return http.StatusBadGateway, "filter_misconfigured"
 		}
 	}
 
-	filterReq, err := http.NewRequestWithContext(r.Context(), r.Method, filterURL.String(), r.Body)
+	filterTarget := *filterURL
+	basePath := strings.TrimRight(filterTarget.Path, "/")
+	if basePath == "" {
+		filterTarget.Path = r.URL.Path
+		filterTarget.RawPath = r.URL.RawPath
+	} else {
+		filterTarget.Path = basePath + r.URL.Path
+		// Preserve the original escaped request path when the filter URL has a
+		// base path. Clearing RawPath here would turn an encoded slash (%2F)
+		// into a path separator before the sidecar sees it.
+		filterTarget.RawPath = strings.TrimRight(filterURL.EscapedPath(), "/") + r.URL.EscapedPath()
+	}
+	filterTarget.RawQuery = r.URL.RawQuery
+	filterReq, err := http.NewRequestWithContext(r.Context(), r.Method, filterTarget.String(), r.Body)
 	if err != nil {
-		http.Error(w, "bad gateway", http.StatusBadGateway)
-		return http.StatusBadGateway, "filter_request_error"
+		brokercore.WriteProxyError(w, http.StatusBadGateway, "filter_misconfigured", "failed to build filter request")
+		return http.StatusBadGateway, "filter_misconfigured"
 	}
 	filterReq.ContentLength = r.ContentLength
-	brokercore.ApplyInjection(r.Header, filterReq.Header, &brokercore.InjectResult{})
+	wsUpgrade := isWebSocketUpgrade(r)
+	if wsUpgrade {
+		copyWebSocketHandshakeHeaders(r.Header, filterReq.Header)
+		brokercore.ApplyInjection(r.Header, filterReq.Header, &brokercore.InjectResult{}, websocketHandshakeHeaderNames...)
+	} else {
+		brokercore.ApplyInjection(r.Header, filterReq.Header, &brokercore.InjectResult{})
+	}
 	stripFilterInternalHeaders(filterReq.Header)
+	filterReq.Host = hostHeaderForScheme(scheme, target)
 	filterReq.Header.Set(filterContinuationProxyHeader, continuationProxy)
+	filterReq.Header.Set(filterContinuationTokenHeader, continuationToken)
 	filterReq.Header.Set(filterCAHeader, base64.StdEncoding.EncodeToString(p.ca.RootPEM()))
-	if policyProxy != "" {
-		filterReq.Header.Set(filterPolicyProxyHeader, policyProxy)
+	if policyToken != "" {
+		filterReq.Header.Set(filterPolicyProxyHeader, continuationProxy)
+		filterReq.Header.Set(filterPolicyTokenHeader, policyToken)
 	}
 	targetURL := &url.URL{
 		Scheme:   scheme,
@@ -300,11 +391,31 @@ func (p *Proxy) forwardToFilter(
 		RawQuery: r.URL.RawQuery,
 	}
 	filterReq.Header.Set(filterTargetURLHeader, targetURL.String())
+	filterReq.Header.Set(filterServiceHeader, match.MatchedName)
 
-	resp, err := p.filterUpstream.RoundTrip(filterReq)
+	transport := p.filterUpstream
+	if filterURL.Scheme == "http" {
+		transport = p.filterPrivateUpstream
+	}
+	if wsUpgrade {
+		status, code := http.StatusBadGateway, "filter_unreachable"
+		p.forwardWebSocketVia(w, r, filterReq, nil, transport, true, func(s int, c string) {
+			status, code = s, c
+		})
+		if code == "upstream_error" {
+			code = "filter_unreachable"
+		}
+		return status, code
+	}
+
+	resp, err := transport.RoundTrip(filterReq)
 	if err != nil {
-		http.Error(w, "bad gateway", http.StatusBadGateway)
-		return http.StatusBadGateway, "filter_unreachable"
+		status, code := http.StatusBadGateway, "filter_unreachable"
+		if isFilterTimeout(err) {
+			status, code = http.StatusGatewayTimeout, "filter_timeout"
+		}
+		brokercore.WriteProxyError(w, status, code, "service filter is unreachable")
+		return status, code
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -341,12 +452,43 @@ func (p *Proxy) forwardToFilter(
 	return resp.StatusCode, ""
 }
 
+func isFilterTimeout(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
 func isLoopbackURL(target *url.URL) bool {
 	ip := net.ParseIP(target.Hostname())
 	return ip != nil && ip.IsLoopback()
 }
 
 func (p *Proxy) resolveScope(ctx context.Context, token, hint, target string) (*brokercore.ProxyScope, error) {
+	if p.filterCapabilityStore != nil && strings.HasPrefix(token, store.FilterCapabilityTokenPrefix) {
+		capability, err := p.filterCapabilityStore.ResolveFilterCapability(ctx, token, target, time.Now())
+		if err != nil || capability == nil {
+			return nil, brokercore.ErrInvalidSession
+		}
+		scope := &brokercore.ProxyScope{
+			VaultID: capability.TargetVaultID, VaultName: capability.TargetVaultName,
+			VaultRole: capability.TargetVaultRole, SourceSessionHash: capability.SourceSessionHash,
+		}
+		if capability.SourceActorType == brokercore.ActorTypeUser {
+			scope.UserID = capability.SourceActorID
+		} else {
+			scope.AgentID = capability.SourceActorID
+		}
+		switch capability.Kind {
+		case store.FilterCapabilityPolicy:
+			scope.FilterPolicy = true
+			scope.FilterPolicyExpiresAt = capability.ExpiresAt
+			scope.FilterPolicyCapability = token
+		case store.FilterCapabilityContinuation:
+			scope.FilterContinuation = token
+		default:
+			return nil, brokercore.ErrInvalidSession
+		}
+		return scope, nil
+	}
 	if scope, recognized, err := p.filterCaps.resolve(token, target); recognized {
 		return scope, err
 	}

@@ -191,12 +191,13 @@ func (s *Server) ResolvePolicyVault(ctx context.Context, name string, source *br
 		return nil, fmt.Errorf("resolve policy vault %q: not found", name)
 	}
 	return &brokercore.ProxyScope{
-		AgentID:      source.AgentID,
-		UserID:       source.UserID,
-		VaultID:      vault.ID,
-		VaultName:    vault.Name,
-		VaultRole:    "proxy",
-		FilterPolicy: true,
+		AgentID:           source.AgentID,
+		UserID:            source.UserID,
+		VaultID:           vault.ID,
+		VaultName:         vault.Name,
+		VaultRole:         "proxy",
+		SourceSessionHash: source.SourceSessionHash,
+		FilterPolicy:      true,
 	}, nil
 }
 
@@ -1104,6 +1105,7 @@ func (s *Server) Start() error {
 	pruneCtx, stopWorkers := context.WithCancel(context.Background())
 	defer stopWorkers()
 	go s.runTouchCachePruner(pruneCtx)
+	go s.runFilterCapabilityPruner(pruneCtx)
 
 	// syncerDone closes once Syncer.Run has returned AND drained its in-flight
 	// refresh goroutines. We block on it before WipeBytes so a refresh mid-
@@ -1407,6 +1409,31 @@ func (s *Server) runTouchCachePruner(ctx context.Context) {
 	}
 }
 
+type filterCapabilityExpirer interface {
+	DeleteExpiredFilterCapabilities(context.Context, time.Time) (int, error)
+}
+
+// runFilterCapabilityPruner bounds the shared short-lived capability table.
+// Issuance also prunes opportunistically; this worker covers quiet instances.
+func (s *Server) runFilterCapabilityPruner(ctx context.Context) {
+	expirer, ok := s.store.(filterCapabilityExpirer)
+	if !ok {
+		return
+	}
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			if _, err := expirer.DeleteExpiredFilterCapabilities(ctx, now); err != nil && ctx.Err() == nil {
+				s.logger.Warn("filter capability cleanup failed", "err", err.Error())
+			}
+		}
+	}
+}
+
 const (
 	scopedSessionMinTTL     = 5 * time.Minute
 	scopedSessionMaxTTL     = 7 * 24 * time.Hour
@@ -1426,6 +1453,9 @@ func isSecureRequest(r *http.Request, baseURL string) bool {
 // sessionCookie builds an av_session cookie with all hardening flags set.
 // Secure is set based on TLS state or the server's configured baseURL.
 func sessionCookie(r *http.Request, baseURL, value string, maxAge int) *http.Cookie {
+	// Secure is intentionally conditional so local plain-HTTP development can
+	// receive the cookie; HttpOnly and strict SameSite remain mandatory.
+	//nolint:gosec // G124 cannot infer isSecureRequest's trusted-base-URL check.
 	return &http.Cookie{
 		Name:     "av_session",
 		Value:    value,

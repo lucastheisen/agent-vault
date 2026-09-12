@@ -59,10 +59,31 @@ func (p *Proxy) forwardWebSocket(
 	wsSubs []brokercore.ResolvedSubstitution,
 	emit func(status int, errCode string),
 ) {
-	upstreamConn, upstreamReader, resp, err := p.dialWebSocketUpstream(r.Context(), outReq)
+	p.forwardWebSocketVia(w, r, outReq, wsSubs, p.upstream, false, emit)
+}
+
+func (p *Proxy) forwardWebSocketVia(
+	w http.ResponseWriter,
+	r *http.Request,
+	outReq *http.Request,
+	wsSubs []brokercore.ResolvedSubstitution,
+	transport *http.Transport,
+	filterHop bool,
+	emit func(status int, errCode string),
+) {
+	upstreamConn, upstreamReader, resp, err := p.dialWebSocketUpstreamVia(r.Context(), outReq, transport)
 	if err != nil {
-		http.Error(w, "bad gateway", http.StatusBadGateway)
-		emit(http.StatusBadGateway, "upstream_error")
+		status, code := http.StatusBadGateway, "upstream_error"
+		if filterHop {
+			code = "filter_unreachable"
+			if isFilterTimeout(err) {
+				status, code = http.StatusGatewayTimeout, "filter_timeout"
+			}
+			brokercore.WriteProxyError(w, status, code, "service filter is unreachable")
+		} else {
+			http.Error(w, "bad gateway", status)
+		}
+		emit(status, code)
 		return
 	}
 	defer func() {
@@ -83,7 +104,7 @@ func (p *Proxy) forwardWebSocket(
 		}
 
 		for k, vv := range resp.Header {
-			if brokercore.ShouldStripResponseHeader(k) {
+			if brokercore.ShouldStripResponseHeader(k) || isFilterInternalHeader(k) {
 				continue
 			}
 			for _, v := range vv {
@@ -154,11 +175,12 @@ func (p *Proxy) forwardWebSocket(
 // keepalive pings comfortably fit inside this window.
 const wsIdleTimeout = 10 * time.Minute
 
-func (p *Proxy) dialWebSocketUpstream(
+func (p *Proxy) dialWebSocketUpstreamVia(
 	ctx context.Context,
 	outReq *http.Request,
+	transport *http.Transport,
 ) (net.Conn, *bufio.Reader, *http.Response, error) {
-	dialCtx := p.upstream.DialContext
+	dialCtx := transport.DialContext
 	if dialCtx == nil {
 		dialer := &net.Dialer{}
 		dialCtx = dialer.DialContext
@@ -173,7 +195,7 @@ func (p *Proxy) dialWebSocketUpstream(
 	// rawConn. pipeWebSocket/copyWithIdleTimeout downstream use only
 	// net.Conn methods, so a *net.TCPConn substitutes for *tls.Conn.
 	if outReq.URL.Scheme == "http" {
-		headerTimeout := p.responseHeaderTimeout()
+		headerTimeout := responseHeaderTimeoutFor(transport)
 		_ = rawConn.SetDeadline(time.Now().Add(headerTimeout))
 		if err := outReq.Write(rawConn); err != nil {
 			_ = rawConn.Close()
@@ -190,8 +212,8 @@ func (p *Proxy) dialWebSocketUpstream(
 	}
 
 	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12}
-	if p.upstream.TLSClientConfig != nil {
-		tlsConfig = p.upstream.TLSClientConfig.Clone()
+	if transport.TLSClientConfig != nil {
+		tlsConfig = transport.TLSClientConfig.Clone()
 	}
 	if tlsConfig.ServerName == "" {
 		if host, _, err := net.SplitHostPort(outReq.URL.Host); err == nil {
@@ -204,14 +226,14 @@ func (p *Proxy) dialWebSocketUpstream(
 	tlsConfig.NextProtos = []string{"http/1.1"}
 
 	tlsConn := tls.Client(rawConn, tlsConfig)
-	_ = tlsConn.SetDeadline(time.Now().Add(p.tlsHandshakeTimeout()))
+	_ = tlsConn.SetDeadline(time.Now().Add(tlsHandshakeTimeoutFor(transport)))
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		_ = rawConn.Close()
 		return nil, nil, nil, err
 	}
 	_ = tlsConn.SetDeadline(time.Time{})
 
-	headerTimeout := p.responseHeaderTimeout()
+	headerTimeout := responseHeaderTimeoutFor(transport)
 	_ = tlsConn.SetDeadline(time.Now().Add(headerTimeout))
 	if err := outReq.Write(tlsConn); err != nil {
 		_ = tlsConn.Close()
@@ -229,16 +251,16 @@ func (p *Proxy) dialWebSocketUpstream(
 	return tlsConn, reader, resp, nil
 }
 
-func (p *Proxy) tlsHandshakeTimeout() time.Duration {
-	if p.upstream.TLSHandshakeTimeout > 0 {
-		return p.upstream.TLSHandshakeTimeout
+func tlsHandshakeTimeoutFor(transport *http.Transport) time.Duration {
+	if transport != nil && transport.TLSHandshakeTimeout > 0 {
+		return transport.TLSHandshakeTimeout
 	}
 	return 10 * time.Second
 }
 
-func (p *Proxy) responseHeaderTimeout() time.Duration {
-	if p.upstream.ResponseHeaderTimeout > 0 {
-		return p.upstream.ResponseHeaderTimeout
+func responseHeaderTimeoutFor(transport *http.Transport) time.Duration {
+	if transport != nil && transport.ResponseHeaderTimeout > 0 {
+		return transport.ResponseHeaderTimeout
 	}
 	return 30 * time.Second
 }
@@ -281,6 +303,9 @@ func writeWebSocketSwitchingResponse(w io.Writer, resp *http.Response) error {
 }
 
 func isSafeWebSocketSwitchHeader(name string) bool {
+	if isFilterInternalHeader(name) {
+		return false
+	}
 	switch http.CanonicalHeaderKey(name) {
 	case "Connection",
 		"Upgrade",

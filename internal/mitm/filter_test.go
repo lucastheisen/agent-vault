@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -22,6 +23,7 @@ import (
 
 func TestMITMFilterContinuationInjectsAfterFiltering(t *testing.T) {
 	var filterAuth string
+	var continuationProxy, continuationToken, policyToken, originalURL, serviceHeader, filterPath string
 	var upstreamAuth string
 	var mu sync.Mutex
 	var upstreamRequests atomic.Int32
@@ -42,6 +44,12 @@ func TestMITMFilterContinuationInjectsAfterFiltering(t *testing.T) {
 	filter := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		filterAuth = r.Header.Get("Authorization")
+		continuationProxy = r.Header.Get(filterContinuationProxyHeader)
+		continuationToken = r.Header.Get(filterContinuationTokenHeader)
+		policyToken = r.Header.Get(filterPolicyTokenHeader)
+		originalURL = r.Header.Get(filterTargetURLHeader)
+		serviceHeader = r.Header.Get(filterServiceHeader)
+		filterPath = r.URL.EscapedPath()
 		mu.Unlock()
 		forwardFilterRequest(t, w, r)
 	}))
@@ -61,7 +69,19 @@ func TestMITMFilterContinuationInjectsAfterFiltering(t *testing.T) {
 	}}
 	proxyURL, _, _ := setupProxy(t, sr, cp)
 
-	response := requestThroughProxy(t, proxyURL, "agent-session", upstream.URL)
+	proxyWithAuth := *proxyURL
+	proxyWithAuth.User = url.User("agent-session")
+	request, err := http.NewRequest(http.MethodGet, upstream.URL+"/repo%2Fname?service=push", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set(filterTargetURLHeader, "https://attacker.invalid/")
+	request.Header.Set(filterContinuationTokenHeader, "forged-continuation")
+	request.Header.Set(filterPolicyTokenHeader, "forged-policy")
+	response, err := (&http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(&proxyWithAuth)}}).Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer response.Body.Close()
 	body, err := io.ReadAll(response.Body)
 	if err != nil {
@@ -74,6 +94,16 @@ func TestMITMFilterContinuationInjectsAfterFiltering(t *testing.T) {
 	defer mu.Unlock()
 	if filterAuth != "" {
 		t.Fatalf("filter received injected Authorization header %q", filterAuth)
+	}
+	parsedProxy, err := url.Parse(continuationProxy)
+	if err != nil || parsedProxy.User != nil || continuationToken == "" {
+		t.Fatalf("split continuation protocol proxy=%q token-present=%t err=%v", continuationProxy, continuationToken != "", err)
+	}
+	if continuationToken == "forged-continuation" || policyToken != "" {
+		t.Fatalf("reserved headers were not overwritten/cleared: continuation=%q policy=%q", continuationToken, policyToken)
+	}
+	if originalURL != upstream.URL+"/repo%2Fname?service=push" || serviceHeader != "gitlab-push" || filterPath != "/gitlab-push/repo%2Fname" {
+		t.Fatalf("filter metadata original=%q service=%q path=%q", originalURL, serviceHeader, filterPath)
 	}
 	if upstreamAuth != "Bearer push-token" {
 		t.Fatalf("upstream Authorization = %q, want injected push credential", upstreamAuth)
@@ -124,6 +154,36 @@ func TestMITMFilterDenyDoesNotReachUpstream(t *testing.T) {
 	}
 	if cp.ResolveCalls() != 0 {
 		t.Fatalf("credential resolution count = %d, want 0 before continuation", cp.ResolveCalls())
+	}
+}
+
+func TestMITMFilterUnreachableUsesProxyErrorEnvelope(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadURL := "http://" + listener.Addr().String()
+	_ = listener.Close()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("unreachable-filter request reached destination")
+	}))
+	defer upstream.Close()
+	upstreamURL := mustParseURL(t, upstream.URL)
+	cp := &fakeCredProvider{byHost: map[string]fakeInjectResult{
+		upstreamURL.Hostname(): {filter: &broker.Filter{URL: deadURL}, result: &brokercore.InjectResult{MatchedName: "filtered"}},
+	}}
+	proxyURL, _, _ := setupProxy(t,
+		validTokenResolver("agent-session", &brokercore.ProxyScope{VaultID: "v1", VaultName: "default", VaultRole: "proxy"}), cp)
+	resp := requestThroughProxy(t, proxyURL, "agent-session", upstream.URL)
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusBadGateway || resp.Header.Get(brokercore.ProxyErrorHeader) != "true" ||
+		!strings.Contains(string(body), "filter_unreachable") {
+		t.Fatalf("unreachable response status=%d header=%q body=%s", resp.StatusCode, resp.Header.Get(brokercore.ProxyErrorHeader), body)
+	}
+	if cp.ResolveCalls() != 0 {
+		t.Fatalf("credential resolved %d times", cp.ResolveCalls())
 	}
 }
 
@@ -205,11 +265,12 @@ func TestMITMFilterPolicyVaultUsesSeparateCredentialScope(t *testing.T) {
 
 	filter := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		policyProxy := r.Header.Get(filterPolicyProxyHeader)
-		if policyProxy == "" {
+		policyToken := r.Header.Get(filterPolicyTokenHeader)
+		if policyProxy == "" || policyToken == "" {
 			http.Error(w, "missing policy proxy", http.StatusBadGateway)
 			return
 		}
-		response := requestThroughProxy(t, mustParseURL(t, policyProxy), "", policyUpstream.URL)
+		response := requestThroughProxy(t, mustParseURL(t, policyProxy), policyToken, policyUpstream.URL)
 		defer response.Body.Close()
 		if response.StatusCode != http.StatusOK {
 			http.Error(w, "policy request failed", http.StatusBadGateway)
@@ -257,6 +318,50 @@ func TestMITMFilterPolicyVaultUsesSeparateCredentialScope(t *testing.T) {
 	}
 }
 
+func TestMITMFilterPolicyCapabilityCannotInvokeFilteredService(t *testing.T) {
+	var nestedFilterHits atomic.Int32
+	nestedFilter := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		nestedFilterHits.Add(1)
+	}))
+	defer nestedFilter.Close()
+	nestedTarget := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer nestedTarget.Close()
+	pushTarget := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("push destination reached before continuation")
+	}))
+	defer pushTarget.Close()
+
+	filter := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resp := requestThroughProxy(t, mustParseURL(t, r.Header.Get(filterPolicyProxyHeader)), r.Header.Get(filterPolicyTokenHeader), nestedTarget.URL)
+		defer resp.Body.Close()
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(w, resp.Body)
+	}))
+	defer filter.Close()
+
+	pushURL := mustParseURL(t, pushTarget.URL)
+	nestedURL := mustParseURL(t, nestedTarget.URL)
+	cp := &fakeCredProvider{byHostPort: map[string]fakeInjectResult{
+		pushURL.Host:   {filter: &broker.Filter{URL: filter.URL, PolicyVault: "policy"}, result: &brokercore.InjectResult{MatchedName: "push"}},
+		nestedURL.Host: {filter: &broker.Filter{URL: nestedFilter.URL}, result: &brokercore.InjectResult{MatchedName: "nested"}},
+	}}
+	source := &brokercore.ProxyScope{AgentID: "agent", VaultID: "source-id", VaultName: "source", VaultRole: "proxy"}
+	proxyURL, _, _ := setupProxy(t, validTokenResolver("agent-session", source), cp, func(opts *Options) {
+		opts.PolicyVault = func(context.Context, string, *brokercore.ProxyScope) (*brokercore.ProxyScope, error) {
+			return &brokercore.ProxyScope{AgentID: "agent", VaultID: "policy-id", VaultName: "policy", VaultRole: "proxy", FilterPolicy: true}, nil
+		}
+	})
+	resp := requestThroughProxy(t, proxyURL, "agent-session", pushTarget.URL)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("policy recursion status=%d body=%s", resp.StatusCode, body)
+	}
+	if nestedFilterHits.Load() != 0 || cp.ResolveCalls() != 0 {
+		t.Fatalf("nested filter hits=%d resolve calls=%d", nestedFilterHits.Load(), cp.ResolveCalls())
+	}
+}
+
 func TestMITMFilterContinuationRejectsChangedRequest(t *testing.T) {
 	var upstreamRequests atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
@@ -270,7 +375,7 @@ func TestMITMFilterContinuationRejectsChangedRequest(t *testing.T) {
 
 	filter := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		continuationProxy := mustParseURL(t, r.Header.Get(filterContinuationProxyHeader))
-		response := requestThroughProxy(t, continuationProxy, "", upstream.URL+"/different?allowed=true")
+		response := requestThroughProxy(t, continuationProxy, r.Header.Get(filterContinuationTokenHeader), upstream.URL+"/different?allowed=true")
 		defer response.Body.Close()
 		w.WriteHeader(response.StatusCode)
 		_, _ = io.Copy(w, response.Body)
@@ -378,6 +483,28 @@ func TestParseFilterProxyURL(t *testing.T) {
 	})
 }
 
+func TestFilterPrivateDialPolicy(t *testing.T) {
+	for _, address := range []string{"8.8.8.8:80", "169.254.169.254:80", "[fd00::1]:80"} {
+		if _, err := newFilterTransport(true).DialContext(context.Background(), "tcp", address); err == nil || !strings.Contains(err.Error(), "blocked") {
+			t.Fatalf("private filter dial %s error = %v, want blocked", address, err)
+		}
+	}
+	if _, err := newFilterTransport(false).DialContext(context.Background(), "tcp", "169.254.169.254:443"); err == nil || !strings.Contains(err.Error(), "blocked") {
+		t.Fatalf("secure filter link-local error = %v, want blocked", err)
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	conn, err := newFilterTransport(true).DialContext(context.Background(), "tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatalf("loopback filter dial: %v", err)
+	}
+	_ = conn.Close()
+}
+
 func TestFilterContinuationCapabilityIsSingleUse(t *testing.T) {
 	capabilities := newFilterCapabilities()
 	scope := &brokercore.ProxyScope{VaultID: "agent-vault"}
@@ -412,7 +539,8 @@ func TestFilterContinuationCapabilityIsSingleUse(t *testing.T) {
 func forwardFilterRequest(t *testing.T, w http.ResponseWriter, r *http.Request, roots ...*x509.CertPool) {
 	t.Helper()
 	continuationProxy := r.Header.Get(filterContinuationProxyHeader)
-	if continuationProxy == "" {
+	continuationToken := r.Header.Get(filterContinuationTokenHeader)
+	if continuationProxy == "" || continuationToken == "" {
 		http.Error(w, "missing continuation proxy", http.StatusBadGateway)
 		return
 	}
@@ -422,6 +550,7 @@ func forwardFilterRequest(t *testing.T, w http.ResponseWriter, r *http.Request, 
 		return
 	}
 	proxyURL := mustParseURL(t, continuationProxy)
+	proxyURL.User = url.User(continuationToken)
 	request, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL.String(), r.Body)
 	if err != nil {
 		http.Error(w, "build continuation request", http.StatusBadGateway)

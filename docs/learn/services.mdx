@@ -189,14 +189,20 @@ services:
       policy_vault: gitlab-push-policy
 ```
 
-`policy_vault` is optional.
-When present, the caller configuring the service must be an admin of both the
-service vault and the separate policy vault.
+`policy_vault` is optional. When omitted, no policy capability is created: the
+filter decides from the intercepted request alone. Set it explicitly to the
+source vault for a same-vault policy lookup, or to a different vault for a
+split-vault layout. A different policy vault requires the configuring caller
+to be an admin of both vaults.
 The filter receives a short-lived proxy capability for that policy vault, so
 its own API lookups can use credentials and services that the agent cannot use.
 Use a dedicated policy vault containing only the services and credentials the
 filter needs.
-Policy-vault services cannot themselves invoke another policy filter.
+Policy capabilities cannot invoke any filtered service, preventing nested
+filter hops. They can use unfiltered services in their policy vault for 30
+seconds. A dedicated read-only policy vault minimizes that temporary scope;
+same-vault mode is convenient but also permits other unfiltered services in
+that vault during the window.
 Filters are intentionally admin-configured and are not accepted through agent
 proposals because they delegate cross-vault authority.
 
@@ -204,33 +210,43 @@ Agent Vault sends the original method, headers, and streaming body to the
 filter URL without resolving the destination credential.
 It adds these internal headers:
 
-- `X-Agent-Vault-Target-URL`: The exact original destination URL.
-- `X-Agent-Vault-Continuation-Proxy`: A proxy URL containing a 30-second,
-  single-use capability for the exact method and destination URL.
-- `X-Agent-Vault-Policy-Proxy`: A reusable 30-second proxy URL scoped to
-  `policy_vault`; omitted when no policy vault is configured.
+- `X-Agent-Vault-Original-URL`: The exact original destination URL.
+- `X-Agent-Vault-Continuation-Proxy`: The callback proxy base URL.
+- `X-Agent-Vault-Continuation-Token`: A 30-second, single-use bearer bound to
+  the exact method and destination URL.
+- `X-Agent-Vault-Policy-Proxy`: The callback proxy base URL for policy calls.
+- `X-Agent-Vault-Policy-Token`: A reusable 30-second bearer scoped to
+  `policy_vault`. Both policy headers are omitted when no policy vault is set.
 - `X-Agent-Vault-CA`: The Agent Vault MITM root certificate as base64-encoded
   PEM, for a client that continues an HTTPS request.
+- `X-Agent-Vault-Service`: The matched service name.
 
-To allow a request, the filter sends it to `X-Agent-Vault-Target-URL` through
-`X-Agent-Vault-Continuation-Proxy` and returns that response.
+To allow a request, the filter sends it to `X-Agent-Vault-Original-URL` through
+`X-Agent-Vault-Continuation-Proxy`, using the continuation token as the proxy
+bearer, and returns that response.
 The filter may change headers or the body, but changing the method or target
 causes Agent Vault to reject the continuation.
 The continuation is single-use even when the filter keeps a CONNECT tunnel
 open.
 Agent Vault strips all `X-Agent-Vault-*` headers before a request reaches the
 destination and before a response reaches the agent.
-Treat the continuation and policy proxy URLs as short-lived bearer secrets and
-do not log them.
-The proxy URLs contain bearer capabilities: filters must not persist or log
-them.
+The proxy URLs do not contain secrets. Treat both token headers as bearer
+secrets and never persist or log them. Revoking the source session or agent, or
+removing its source-vault access, invalidates outstanding capabilities
+immediately.
 
 Request bodies are streamed rather than duplicated in Agent Vault.
 A filter that consumes a body before continuing is responsible for buffering
 or spooling and replaying it within the configured request-size limit.
-WebSocket upgrades are not supported on filtered services.
+WebSocket upgrades are proxied to the filter. To allow one, the filter opens a
+new WebSocket through the exact continuation and bridges the streams. The
+30-second deadline applies only to claiming the continuation; the established
+stream uses the normal WebSocket idle timeout.
 
-Plain HTTP filter URLs must use a literal loopback address.
+Plain HTTP filter URLs use a literal loopback address by default. A private
+network sidecar such as `http://filter:12345` additionally requires
+`allow_insecure_private_http: true`; public, link-local, and cloud metadata
+addresses remain blocked. Redirects are disabled. HTTPS is recommended.
 Remote filters must use HTTPS and a certificate trusted by the Agent Vault
 host.
 Use a dedicated policy vault containing only the services and credentials the
@@ -239,6 +255,11 @@ Set `AGENT_VAULT_FILTER_PROXY_URL` to the HTTPS forward-proxy address that the
 remote filter can reach.
 Agent Vault's native proxy listener is HTTP, so deployments normally put a TLS
 terminator in front of that listener for this return path.
+
+`vault service add` preserves an existing filter when the YAML entry omits the
+field; use `filter: null` to clear it. `vault service set` and `vault service
+clear` replace or remove the full list and do not preserve filters. Service
+list output includes filter configuration so a file round-trip remains safe.
 
 ## Substitutions
 

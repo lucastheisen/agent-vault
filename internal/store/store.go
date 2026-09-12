@@ -11,6 +11,12 @@ import (
 // ErrNotFirstUser is returned by RegisterFirstUser when users already exist.
 var ErrNotFirstUser = errors.New("users already exist; not first user")
 
+// ErrInvalidFilterCapability is returned when a filter capability is missing,
+// expired, already spent, bound to a different request, or its source authority
+// is no longer active. Deliberately using one error avoids exposing which part
+// of a bearer capability was valid.
+var ErrInvalidFilterCapability = errors.New("invalid filter capability")
+
 // DefaultVault is the name of the automatically-seeded vault.
 const DefaultVault = "default"
 
@@ -445,6 +451,53 @@ type CAState struct {
 	UpdatedAt    time.Time
 }
 
+// Filter capability wire values. Continuations are single-use; policy
+// capabilities may be reused until expiry while their source authority remains
+// active.
+const (
+	FilterCapabilityContinuation = "continuation"
+	FilterCapabilityPolicy       = "policy"
+
+	FilterCapabilityIssued   = "issued"
+	FilterCapabilityClaimed  = "claimed"
+	FilterCapabilityConsumed = "consumed"
+)
+
+// FilterRequestBinding is the exact non-secret request identity attached to a
+// continuation. Path is the escaped path, not a decoded or normalized form.
+type FilterRequestBinding struct {
+	Method    string
+	Scheme    string
+	Authority string
+	Path      string
+	Query     string
+}
+
+// FilterCapability is the non-secret persisted state for an out-of-process
+// service-filter callback. SourceSessionHash is a one-way SHA-256 digest; raw
+// source and capability bearer tokens are never stored. SnapshotJSON is a
+// versioned frozen credential-match description containing key names and
+// service configuration only, never resolved credential values.
+type FilterCapability struct {
+	Kind              string
+	State             string
+	SourceVaultID     string
+	SourceSessionHash string
+	SourceActorID     string
+	SourceActorType   string
+	SourceAgentID     string
+	TargetVaultID     string
+	TargetVaultName   string
+	TargetVaultRole   string
+	Request           FilterRequestBinding
+	SnapshotVersion   int
+	SnapshotJSON      []byte
+	ExpiresAt         time.Time
+	CreatedAt         time.Time
+	ClaimedAt         *time.Time
+	ConsumedAt        *time.Time
+}
+
 // Store is the persistence interface for Agent Vault.
 // All methods are safe for concurrent use.
 type Store interface {
@@ -648,6 +701,15 @@ type Store interface {
 	// CA state (persistent CA root for Postgres HA deployments)
 	GetCAState(ctx context.Context) (*CAState, error)
 	SetCAState(ctx context.Context, state *CAState) error
+
+	// Shared service-filter capabilities. SourceSessionHash must be the same
+	// SHA-256 session identifier used by the sessions table; no raw bearer is
+	// accepted by this API.
+	CreateFilterCapability(ctx context.Context, capability *FilterCapability) (string, error)
+	ResolveFilterCapability(ctx context.Context, rawToken, connectAuthority string, now time.Time) (*FilterCapability, error)
+	ConsumeFilterContinuation(ctx context.Context, rawToken string, request FilterRequestBinding, now time.Time) (*FilterCapability, error)
+	ValidateFilterPolicyCapability(ctx context.Context, rawToken string, now time.Time) (*FilterCapability, error)
+	DeleteExpiredFilterCapabilities(ctx context.Context, before time.Time) (int, error)
 
 	// LockVault acquires an exclusive advisory lock for the given vault.
 	// The returned function releases the lock. Callers MUST defer the

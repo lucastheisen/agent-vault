@@ -27,6 +27,19 @@ const DefaultMaxResponseBytes int64 = 0
 // responses that happen to share the same status code.
 const ProxyErrorHeader = "X-Agent-Vault-Proxy-Error"
 
+// Filter hop protocol headers. Proxy addresses and bearer capabilities are
+// deliberately separate so ordinary URL/access logging never captures a
+// continuation or policy token.
+const (
+	HeaderFilterOriginalURL       = "X-Agent-Vault-Original-URL"
+	HeaderFilterContinuationProxy = "X-Agent-Vault-Continuation-Proxy"
+	HeaderFilterContinuationToken = "X-Agent-Vault-Continuation-Token"
+	HeaderFilterPolicyProxy       = "X-Agent-Vault-Policy-Proxy"
+	HeaderFilterPolicyToken       = "X-Agent-Vault-Policy-Token"
+	HeaderFilterCA                = "X-Agent-Vault-CA"
+	HeaderFilterService           = "X-Agent-Vault-Service"
+)
+
 // HopByHopHeaders are HTTP/1.1 hop-by-hop headers that must not be
 // forwarded by a proxy. Includes Proxy-Connection — non-RFC but emitted
 // by some HTTP/1.0 clients and conventionally treated as hop-by-hop.

@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"testing"
 
 	"github.com/Infisical/agent-vault/internal/broker"
@@ -863,5 +864,93 @@ func TestInject_DynamicFallback_ErrorPropagates(t *testing.T) {
 	_, err := p.Inject(context.Background(), "v1", "db.example.com", 0, "/")
 	if err == nil {
 		t.Fatalf("expected error to propagate")
+	}
+}
+
+func TestCredentialMatchFreezeRestoreUsesFrozenCredentialKey(t *testing.T) {
+	f := newFakeCredStore()
+	key32 := make32(0x22)
+	port := 8443
+	f.setServices(t, "vault-1", []broker.Service{{
+		Name: "api", Host: "api.example.com", Port: &port,
+		Auth:          broker.Auth{Type: "bearer", Token: "OLD_KEY"},
+		Substitutions: []broker.Substitution{{Key: "SUB_KEY", Placeholder: "__sub__"}},
+	}})
+	f.setCred(t, key32, "vault-1", "OLD_KEY", "initial")
+	f.setCred(t, key32, "vault-1", "SUB_KEY", "substitution")
+	p := NewStoreCredentialProvider(f, key32)
+	match, err := p.Match(context.Background(), "vault-1", "api.example.com", port, "/v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := match.Freeze()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f.setServices(t, "vault-1", []broker.Service{{
+		Name: "api", Host: "api.example.com", Port: &port,
+		Auth: broker.Auth{Type: "bearer", Token: "NEW_KEY"},
+	}})
+	restored, err := RestoreCredentialMatch(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := restored.CredentialKeys, []string{"OLD_KEY", "SUB_KEY"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("credential keys = %v, want %v", got, want)
+	}
+	f.setCred(t, key32, "vault-1", "OLD_KEY", "rotated")
+	resolved, err := p.Resolve(context.Background(), "vault-1", restored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := resolved.Headers["Authorization"]; got != "Bearer rotated" {
+		t.Fatalf("authorization = %q, want current value of frozen key", got)
+	}
+}
+
+func TestCredentialMatchFreezeCanonicalizesCustomCredentialKeys(t *testing.T) {
+	f := newFakeCredStore()
+	f.setServices(t, "vault-1", []broker.Service{{
+		Name: "api", Host: "api.example.com",
+		Auth: broker.Auth{Type: "custom", Headers: map[string]string{
+			"X-Zed":   "{{ Z_KEY }}",
+			"X-Alpha": "{{ A_KEY }}",
+		}},
+		Substitutions: []broker.Substitution{{Key: "M_KEY", Placeholder: "__middle__"}},
+	}})
+	p := NewStoreCredentialProvider(f, make32(0x22))
+	match, err := p.Match(context.Background(), "vault-1", "api.example.com", 0, "/v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := match.Freeze()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var snapshot CredentialMatchSnapshot
+	if err := json.Unmarshal(raw, &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := snapshot.CredentialKeys, []string{"A_KEY", "M_KEY", "Z_KEY"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("snapshot credential keys = %v, want canonical %v", got, want)
+	}
+	for i := 0; i < 20; i++ {
+		if _, err := RestoreCredentialMatch(raw); err != nil {
+			t.Fatalf("restore %d: %v", i, err)
+		}
+	}
+}
+
+func TestRestoreCredentialMatchRejectsUnknownOrMalformedSnapshot(t *testing.T) {
+	for _, raw := range []string{
+		`{"version":99,"vault_id":"vault-1"}`,
+		`{"version":1,"vault_id":"vault-1","matched_name":"api"}`,
+		`{"version":1,"vault_id":"vault-1","passthrough":true}`,
+		`not-json`,
+	} {
+		if _, err := RestoreCredentialMatch([]byte(raw)); !errors.Is(err, ErrServiceNotFound) {
+			t.Fatalf("RestoreCredentialMatch(%q) error = %v, want ErrServiceNotFound", raw, err)
+		}
 	}
 }

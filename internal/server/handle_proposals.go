@@ -166,6 +166,10 @@ func (s *Server) handleProposalCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.Services = normalized
+	if err := rejectFilteredServiceDeletes(existing, req.Services); err != nil {
+		jsonError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	// Validate the proposal.
 	if err := proposal.Validate(req.Services, req.Credentials); err != nil {
@@ -419,6 +423,12 @@ func (s *Server) handleAdminProposalApprove(w http.ResponseWriter, r *http.Reque
 		jsonError(w, http.StatusInternalServerError, "Failed to parse proposal services")
 		return
 	}
+	for i, service := range proposedServices {
+		if service.FilterSpecified() {
+			jsonError(w, http.StatusConflict, fmt.Sprintf("service %d: filter is admin-configured and cannot be proposed", i))
+			return
+		}
+	}
 	var credentialSlots []proposal.CredentialSlot
 	if err := json.Unmarshal([]byte(cs.CredentialsJSON), &credentialSlots); err != nil {
 		jsonError(w, http.StatusInternalServerError, "Failed to parse proposal credentials")
@@ -527,6 +537,10 @@ func (s *Server) handleAdminProposalApprove(w http.ResponseWriter, r *http.Reque
 		writeNormalizeError(w, err, http.StatusConflict, http.StatusInternalServerError, func(host string) string {
 			return fmt.Sprintf("proposal targets host %q which no longer matches any service in this vault — reject the proposal manually", host)
 		})
+		return
+	}
+	if err := rejectFilteredServiceDeletes(existingServices, proposedServices); err != nil {
+		jsonError(w, http.StatusConflict, err.Error())
 		return
 	}
 
