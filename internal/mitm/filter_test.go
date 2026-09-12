@@ -34,19 +34,34 @@ func (m *matchingCredProvider) Match(_ context.Context, _, targetHost string, _ 
 	return nil, nil
 }
 
-type staticFilterTokens struct{ token string }
-
-func (s staticFilterTokens) FilterAgentToken(_ context.Context, _ string) (string, error) {
-	return s.token, nil
+func capResolver(caps brokercore.CapabilityStore, fallback *brokercore.ProxyScope) *fakeSessionResolver {
+	return &fakeSessionResolver{resolve: func(token, _ string) (*brokercore.ProxyScope, error) {
+		if brokercore.IsCapabilityToken(token) {
+			c, err := caps.Authenticate(context.Background(), token)
+			if err != nil {
+				return nil, err
+			}
+			scope := c.Scope()
+			scope.RawToken = token
+			return scope, nil
+		}
+		if fallback != nil {
+			cp := *fallback
+			cp.RawToken = token
+			return &cp, nil
+		}
+		return nil, brokercore.ErrInvalidSession
+	}}
 }
 
 func TestMITMFilterHopShortCircuit(t *testing.T) {
-	var sawOrig, sawToken, sawNonce, sawSvc string
+	var sawOrig, sawCont, sawProxy, sawSvc, sawAuth string
 	filter := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		sawOrig = r.Header.Get(brokercore.HeaderOriginalURL)
-		sawToken = r.Header.Get(brokercore.HeaderFilterToken)
-		sawNonce = r.Header.Get(brokercore.HeaderFilterNonce)
+		sawCont = r.Header.Get(brokercore.HeaderContinuationToken)
+		sawProxy = r.Header.Get(brokercore.HeaderContinuationProxy)
 		sawSvc = r.Header.Get(brokercore.HeaderService)
+		sawAuth = r.Header.Get("Authorization")
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusForbidden)
 		_, _ = io.WriteString(w, `{"error":"protected"}`)
@@ -59,8 +74,8 @@ func TestMITMFilterHopShortCircuit(t *testing.T) {
 	defer upstream.Close()
 
 	upstreamHost, _, _ := net.SplitHostPort(strings.TrimPrefix(upstream.URL, "https://"))
-	sr := validTokenResolver("av_sess_ok",
-		&brokercore.ProxyScope{VaultID: "v1", VaultName: "default", VaultRole: "proxy", AgentID: "agent-1"})
+	caps := brokercore.NewMemoryCapabilities()
+	sr := capResolver(caps, &brokercore.ProxyScope{VaultID: "v1", VaultName: "default", VaultRole: "proxy", AgentID: "agent-1"})
 	cp := &matchingCredProvider{
 		fakeCredProvider: fakeCredProvider{byHost: map[string]fakeInjectResult{
 			upstreamHost: {result: &brokercore.InjectResult{Headers: map[string]string{"Authorization": "Bearer secret"}}},
@@ -70,16 +85,13 @@ func TestMITMFilterHopShortCircuit(t *testing.T) {
 			Host: upstreamHost,
 			Auth: broker.Auth{Type: "bearer", Token: "GITHUB_TOKEN"},
 			Filter: &broker.Filter{
-				URL:     filter.URL,
-				Vault:   "policy",
-				AgentID: "filter-agent-1",
+				URL:         filter.URL,
+				PolicyVault: "default",
 			},
 		},
 	}
-	signer := &brokercore.TicketSigner{Key: []byte("0123456789abcdef0123456789abcdef")}
 	proxyURL, clientRoots, p := setupProxy(t, sr, cp, func(o *Options) {
-		o.Tickets = signer
-		o.FilterTokens = staticFilterTokens{token: "av_agt_filter"}
+		o.Capabilities = caps
 	})
 	p.upstream.TLSClientConfig.InsecureSkipVerify = true
 
@@ -97,11 +109,11 @@ func TestMITMFilterHopShortCircuit(t *testing.T) {
 		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("status = %d body %s", resp.StatusCode, body)
 	}
-	if sawToken != "av_agt_filter" {
-		t.Fatalf("filter token = %q", sawToken)
+	if !strings.HasPrefix(sawCont, brokercore.ContinuationTokenPrefix) {
+		t.Fatalf("continuation = %q", sawCont)
 	}
-	if sawNonce == "" || !strings.HasPrefix(sawNonce, brokercore.ContinuationTokenPrefix) {
-		t.Fatalf("nonce = %q", sawNonce)
+	if sawProxy == "" {
+		t.Fatal("expected continuation proxy URL")
 	}
 	if sawSvc != "github-push" {
 		t.Fatalf("service = %q", sawSvc)
@@ -109,12 +121,15 @@ func TestMITMFilterHopShortCircuit(t *testing.T) {
 	if !strings.Contains(sawOrig, upstreamHost) {
 		t.Fatalf("original url = %q", sawOrig)
 	}
+	if sawAuth != "" {
+		t.Fatalf("origin credential leaked onto filter hop: %q", sawAuth)
+	}
 }
 
 func TestMITMFilterHopOverwritesClientHopHeaders(t *testing.T) {
-	var sawToken, sawVault, sawProxyAuth string
+	var sawCont, sawVault, sawProxyAuth string
 	filter := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		sawToken = r.Header.Get(brokercore.HeaderFilterToken)
+		sawCont = r.Header.Get(brokercore.HeaderContinuationToken)
 		sawVault = r.Header.Get("X-Vault")
 		sawProxyAuth = r.Header.Get("Proxy-Authorization")
 		w.WriteHeader(http.StatusNoContent)
@@ -127,13 +142,11 @@ func TestMITMFilterHopOverwritesClientHopHeaders(t *testing.T) {
 	defer upstream.Close()
 
 	upstreamHost, _, _ := net.SplitHostPort(strings.TrimPrefix(upstream.URL, "https://"))
-	sr := validTokenResolver("av_sess_ok",
-		&brokercore.ProxyScope{VaultID: "v1", VaultName: "dev", VaultRole: "proxy", AgentID: "agent-1"})
-	cp := filteredProvider(upstreamHost, filter.URL, "filter-agent-1")
-	signer := &brokercore.TicketSigner{Key: []byte("0123456789abcdef0123456789abcdef")}
+	caps := brokercore.NewMemoryCapabilities()
+	sr := capResolver(caps, &brokercore.ProxyScope{VaultID: "v1", VaultName: "dev", VaultRole: "proxy", AgentID: "agent-1"})
+	cp := filteredProvider(upstreamHost, filter.URL)
 	proxyURL, clientRoots, p := setupProxy(t, sr, cp, func(o *Options) {
-		o.Tickets = signer
-		o.FilterTokens = staticFilterTokens{token: "av_agt_filter"}
+		o.Capabilities = caps
 	})
 	p.upstream.TLSClientConfig.InsecureSkipVerify = true
 
@@ -142,15 +155,15 @@ func TestMITMFilterHopOverwritesClientHopHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	req.Header.Set(brokercore.HeaderFilterToken, "forged")
+	req.Header.Set(brokercore.HeaderContinuationToken, "forged")
 	req.Header.Set("X-Vault", "attacker")
 	resp, err := client.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	if sawToken != "av_agt_filter" {
-		t.Fatalf("token = %q", sawToken)
+	if !strings.HasPrefix(sawCont, brokercore.ContinuationTokenPrefix) || sawCont == "forged" {
+		t.Fatalf("token = %q", sawCont)
 	}
 	if sawVault != "" {
 		t.Fatalf("inbound X-Vault leaked to sidecar: %q", sawVault)
@@ -167,11 +180,11 @@ func TestMITMFilterUnreachable(t *testing.T) {
 	defer upstream.Close()
 
 	upstreamHost, _, _ := net.SplitHostPort(strings.TrimPrefix(upstream.URL, "https://"))
-	sr := validTokenResolver("av_sess_ok",
-		&brokercore.ProxyScope{VaultID: "v1", VaultName: "default", VaultRole: "proxy", AgentID: "agent-1"})
-	cp := filteredProvider(upstreamHost, "http://127.0.0.1:1", "filter-agent-1")
+	caps := brokercore.NewMemoryCapabilities()
+	sr := capResolver(caps, &brokercore.ProxyScope{VaultID: "v1", VaultName: "default", VaultRole: "proxy", AgentID: "agent-1"})
+	cp := filteredProvider(upstreamHost, "http://127.0.0.1:1")
 	proxyURL, clientRoots, p := setupProxy(t, sr, cp, func(o *Options) {
-		o.FilterTokens = staticFilterTokens{token: "av_agt_filter"}
+		o.Capabilities = caps
 	})
 	p.upstream.TLSClientConfig.InsecureSkipVerify = true
 
@@ -198,7 +211,7 @@ func TestMITMFilterUnreachable(t *testing.T) {
 
 func TestMITMFilterContinuationSkipsSidecar(t *testing.T) {
 	filter := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
-		t.Error("filter must not run for a valid continuation ticket")
+		t.Error("filter must not run for a valid continuation")
 	}))
 	defer filter.Close()
 
@@ -210,45 +223,38 @@ func TestMITMFilterContinuationSkipsSidecar(t *testing.T) {
 	defer upstream.Close()
 
 	upstreamHost, _, _ := net.SplitHostPort(strings.TrimPrefix(upstream.URL, "https://"))
-	signer := &brokercore.TicketSigner{Key: []byte("0123456789abcdef0123456789abcdef")}
-	ticket, err := signer.Mint(brokercore.ContinuationClaims{
-		VaultID: "v1", VaultName: "dev", AgentID: "agent-1", VaultRole: "proxy",
-		Method: "GET", Host: upstreamHost, Path: "/org/repo.git/git-receive-pack",
-		FilterAgentID: "filter-agent-1",
+	caps := brokercore.NewMemoryCapabilities()
+	u, _ := url.Parse(upstream.URL + "/org/repo.git/git-receive-pack")
+	bind := brokercore.BindFromURL(http.MethodGet, u)
+	raw, err := caps.IssueContinuation(context.Background(), brokercore.Capability{
+		SourceVaultID: "v1", VaultName: "dev", ActorAgentID: "agent-1", VaultRole: "proxy",
+		Method: bind.Method, Scheme: bind.Scheme, Authority: bind.Authority,
+		EscapedPath: bind.EscapedPath, Query: bind.Query,
+		Snapshot: brokercore.SnapshotFromService(&broker.Service{
+			Name: "github-push", Host: upstreamHost,
+			Auth: broker.Auth{Type: "bearer", Token: "GITHUB_TOKEN"},
+		}),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	sr := &fakeSessionResolver{resolve: func(token, _ string) (*brokercore.ProxyScope, error) {
-		if strings.HasPrefix(token, brokercore.ContinuationTokenPrefix) {
-			c, err := signer.Parse(token)
-			if err != nil {
-				return nil, err
-			}
-			return c.Scope(), nil
-		}
-		return nil, brokercore.ErrInvalidSession
-	}}
+	sr := capResolver(caps, nil)
 	cp := &matchingCredProvider{
 		fakeCredProvider: fakeCredProvider{byHost: map[string]fakeInjectResult{
 			upstreamHost: {result: &brokercore.InjectResult{Headers: map[string]string{"Authorization": "Bearer secret"}}},
 		}},
 		svc: &broker.Service{
-			Name: "github-push",
-			Host: upstreamHost,
-			Filter: &broker.Filter{
-				URL:     filter.URL,
-				AgentID: "filter-agent-1",
-			},
+			Name:   "github-push",
+			Host:   upstreamHost,
+			Filter: &broker.Filter{URL: filter.URL},
 		},
 	}
 	proxyURL, clientRoots, p := setupProxy(t, sr, cp, func(o *Options) {
-		o.Tickets = signer
-		o.FilterTokens = staticFilterTokens{token: "av_agt_filter"}
+		o.Capabilities = caps
 	})
 	p.upstream.TLSClientConfig.InsecureSkipVerify = true
 
-	client := newTrustingClient(proxyURL, url.User(ticket), clientRoots)
+	client := newTrustingClient(proxyURL, url.User(raw), clientRoots)
 	resp, err := client.Get(upstream.URL + "/org/repo.git/git-receive-pack")
 	if err != nil {
 		t.Fatal(err)
@@ -270,34 +276,65 @@ func TestMITMFilterContinuationMismatch(t *testing.T) {
 	defer upstream.Close()
 
 	upstreamHost, _, _ := net.SplitHostPort(strings.TrimPrefix(upstream.URL, "https://"))
-	signer := &brokercore.TicketSigner{Key: []byte("0123456789abcdef0123456789abcdef")}
-	ticket, err := signer.Mint(brokercore.ContinuationClaims{
-		VaultID: "v1", VaultName: "dev", Method: "GET", Host: upstreamHost, Path: "/allowed",
-		VaultRole: "proxy",
+	caps := brokercore.NewMemoryCapabilities()
+	raw, err := caps.IssueContinuation(context.Background(), brokercore.Capability{
+		SourceVaultID: "v1", VaultName: "dev", Method: "GET", Scheme: "https",
+		Authority: upstreamHost, EscapedPath: "/allowed", VaultRole: "proxy",
+		Snapshot: brokercore.SnapshotFromService(&broker.Service{Name: "s", Host: upstreamHost}),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	sr := &fakeSessionResolver{resolve: func(token, _ string) (*brokercore.ProxyScope, error) {
-		c, err := signer.Parse(token)
-		if err != nil {
-			return nil, err
-		}
-		return c.Scope(), nil
-	}}
+	sr := capResolver(caps, nil)
 	cp := &fakeCredProvider{byHost: map[string]fakeInjectResult{
 		upstreamHost: {result: &brokercore.InjectResult{Passthrough: true}},
 	}}
-	proxyURL, clientRoots, p := setupProxy(t, sr, cp, func(o *Options) { o.Tickets = signer })
+	proxyURL, clientRoots, p := setupProxy(t, sr, cp, func(o *Options) { o.Capabilities = caps })
 	p.upstream.TLSClientConfig.InsecureSkipVerify = true
 
-	client := newTrustingClient(proxyURL, url.User(ticket), clientRoots)
+	client := newTrustingClient(proxyURL, url.User(raw), clientRoots)
 	resp, err := client.Get(upstream.URL + "/other")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+}
+
+func TestMITMFilterPolicyCannotInvokeFiltered(t *testing.T) {
+	filter := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Error("policy cap must not start a nested filter hop")
+	}))
+	defer filter.Close()
+
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Error("origin must not be contacted")
+	}))
+	defer upstream.Close()
+
+	upstreamHost, _, _ := net.SplitHostPort(strings.TrimPrefix(upstream.URL, "https://"))
+	caps := brokercore.NewMemoryCapabilities()
+	raw, err := caps.IssuePolicy(context.Background(), brokercore.Capability{
+		SourceVaultID: "v1", PolicyVaultID: "v1", PolicyVaultName: "default",
+		VaultName: "default", ActorAgentID: "agent-1", VaultRole: "proxy",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sr := capResolver(caps, nil)
+	cp := filteredProvider(upstreamHost, filter.URL)
+	proxyURL, clientRoots, p := setupProxy(t, sr, cp, func(o *Options) { o.Capabilities = caps })
+	p.upstream.TLSClientConfig.InsecureSkipVerify = true
+
+	client := newTrustingClient(proxyURL, url.User(raw), clientRoots)
+	resp, err := client.Get(upstream.URL + "/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway {
 		t.Fatalf("status = %d", resp.StatusCode)
 	}
 }
@@ -336,21 +373,18 @@ func TestMITMFilterWebSocketHopsToSidecar(t *testing.T) {
 	}))
 	defer filter.Close()
 
-	sr := validTokenResolver("av_sess_ok",
-		&brokercore.ProxyScope{VaultID: "v1", VaultName: "default", VaultRole: "proxy", AgentID: "agent-1"})
+	caps := brokercore.NewMemoryCapabilities()
+	sr := capResolver(caps, &brokercore.ProxyScope{VaultID: "v1", VaultName: "default", VaultRole: "proxy", AgentID: "agent-1"})
 	cp := &matchingCredProvider{
 		fakeCredProvider: fakeCredProvider{byHost: map[string]fakeInjectResult{}},
 		svc: &broker.Service{
-			Name: "ws",
-			Host: "*",
-			Filter: &broker.Filter{
-				URL:     filter.URL,
-				AgentID: "filter-agent-1",
-			},
+			Name:   "ws",
+			Host:   "*",
+			Filter: &broker.Filter{URL: filter.URL},
 		},
 	}
 	proxyURL, _, _ := setupProxy(t, sr, cp, func(o *Options) {
-		o.FilterTokens = staticFilterTokens{token: "av_agt_filter"}
+		o.Capabilities = caps
 	})
 
 	conn := dialProxy(t, proxyURL)
@@ -393,62 +427,15 @@ func TestMITMFilterWebSocketHopsToSidecar(t *testing.T) {
 	}
 }
 
-func filteredProvider(host, filterURL, agentID string) *matchingCredProvider {
+func filteredProvider(host, filterURL string) *matchingCredProvider {
 	return &matchingCredProvider{
 		fakeCredProvider: fakeCredProvider{byHost: map[string]fakeInjectResult{
 			host: {result: &brokercore.InjectResult{Headers: map[string]string{"Authorization": "Bearer secret"}}},
 		}},
 		svc: &broker.Service{
-			Name: "github-push",
-			Host: host,
-			Filter: &broker.Filter{
-				URL:     filterURL,
-				Vault:   "policy",
-				AgentID: agentID,
-			},
+			Name:   "github-push",
+			Host:   host,
+			Filter: &broker.Filter{URL: filterURL},
 		},
-	}
-}
-
-func TestMITMFilterSkipForFilterAgent(t *testing.T) {
-	filter := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
-		t.Error("filter must not run for the minted filter-agent")
-	}))
-	defer filter.Close()
-
-	var originHit bool
-	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		originHit = true
-		_, _ = io.WriteString(w, "ok")
-	}))
-	defer upstream.Close()
-
-	upstreamHost, _, _ := net.SplitHostPort(strings.TrimPrefix(upstream.URL, "https://"))
-	sr := validTokenResolver("av_agt_filter",
-		&brokercore.ProxyScope{VaultID: "v1", VaultName: "default", VaultRole: "proxy", AgentID: "filter-agent-1"})
-	cp := &matchingCredProvider{
-		fakeCredProvider: fakeCredProvider{byHost: map[string]fakeInjectResult{
-			upstreamHost: {result: &brokercore.InjectResult{Headers: map[string]string{"Authorization": "Bearer secret"}}},
-		}},
-		svc: &broker.Service{
-			Name: "github-push",
-			Host: upstreamHost,
-			Filter: &broker.Filter{
-				URL:     filter.URL,
-				AgentID: "filter-agent-1",
-			},
-		},
-	}
-	proxyURL, clientRoots, p := setupProxy(t, sr, cp)
-	p.upstream.TLSClientConfig.InsecureSkipVerify = true
-
-	client := newTrustingClient(proxyURL, url.User("av_agt_filter"), clientRoots)
-	resp, err := client.Get(upstream.URL + "/x")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 || !originHit {
-		t.Fatalf("status %d originHit %v", resp.StatusCode, originHit)
 	}
 }

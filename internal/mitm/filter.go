@@ -12,10 +12,15 @@ import (
 
 	"github.com/Infisical/agent-vault/internal/broker"
 	"github.com/Infisical/agent-vault/internal/brokercore"
+	"github.com/Infisical/agent-vault/internal/store"
 )
 
 type serviceMatcher interface {
 	Match(ctx context.Context, vaultID, targetHost string, targetPort int, targetPath string) (*broker.Service, error)
+}
+
+type vaultLookup interface {
+	LookupVault(ctx context.Context, name string) (*store.Vault, error)
 }
 
 func (p *Proxy) maybeForwardFilter(
@@ -39,10 +44,14 @@ func (p *Proxy) maybeForwardFilter(
 		return false
 	}
 
-	skip := scope.SkipFilter ||
-		(scope.AgentID != "" && matched.Filter.AgentID != "" && scope.AgentID == matched.Filter.AgentID)
-	if skip {
+	if scope.SkipFilter {
 		return false
+	}
+	if scope.IsPolicy {
+		brokercore.WriteProxyError(w, http.StatusBadGateway, "filter_misconfigured",
+			"Policy capability cannot invoke a filtered service.")
+		emit(http.StatusBadGateway, "filter_misconfigured")
+		return true
 	}
 
 	p.reverseProxyToFilter(w, r, target, host, useTLSUpstream, scope, matched, emit)
@@ -60,25 +69,15 @@ func (p *Proxy) reverseProxyToFilter(
 ) {
 	filterURL, err := url.Parse(matched.Filter.URL)
 	if err != nil || filterURL.Host == "" {
-		brokercore.WriteProxyError(w, http.StatusBadGateway, "filter_unreachable",
+		brokercore.WriteProxyError(w, http.StatusBadGateway, "filter_misconfigured",
 			"Service filter URL is invalid.")
-		emit(http.StatusBadGateway, "filter_unreachable")
+		emit(http.StatusBadGateway, "filter_misconfigured")
 		return
 	}
-
-	rawToken := ""
-	if p.filterTokens != nil && matched.Filter.AgentID != "" {
-		rawToken, err = p.filterTokens.FilterAgentToken(r.Context(), matched.Filter.AgentID)
-		if err != nil || rawToken == "" {
-			brokercore.WriteProxyError(w, http.StatusBadGateway, "filter_agent_revoked",
-				"Service filter agent is missing or revoked. Re-apply the filter configuration.")
-			emit(http.StatusBadGateway, "filter_agent_revoked")
-			return
-		}
-	} else if matched.Filter.AgentID == "" {
-		brokercore.WriteProxyError(w, http.StatusBadGateway, "filter_agent_revoked",
-			"Service filter is not provisioned. Re-apply the filter configuration.")
-		emit(http.StatusBadGateway, "filter_agent_revoked")
+	if err := broker.ValidateFilter(matched.Filter); err != nil {
+		brokercore.WriteProxyError(w, http.StatusBadGateway, "filter_misconfigured",
+			"Service filter URL is not allowed.")
+		emit(http.StatusBadGateway, "filter_misconfigured")
 		return
 	}
 
@@ -93,26 +92,73 @@ func (p *Proxy) reverseProxyToFilter(
 		RawPath:  r.URL.RawPath,
 		RawQuery: r.URL.RawQuery,
 	}
+	bind := brokercore.BindFromURL(r.Method, origURL)
 
-	nonce := ""
-	if p.tickets != nil {
-		nonce, err = p.tickets.Mint(brokercore.ContinuationClaims{
-			VaultID:       scope.VaultID,
-			VaultName:     scope.VaultName,
-			UserID:        scope.UserID,
-			AgentID:       scope.AgentID,
-			VaultRole:     scope.VaultRole,
-			Method:        r.Method,
-			Host:          host,
-			Path:          r.URL.Path,
-			FilterAgentID: matched.Filter.AgentID,
-		})
-		if err != nil {
-			brokercore.WriteProxyError(w, http.StatusBadGateway, "filter_unreachable",
-				"Failed to mint filter continuation ticket.")
-			emit(http.StatusBadGateway, "filter_unreachable")
+	if p.caps == nil {
+		brokercore.WriteProxyError(w, http.StatusBadGateway, "filter_misconfigured",
+			"Filter capabilities are not configured.")
+		emit(http.StatusBadGateway, "filter_misconfigured")
+		return
+	}
+
+	contRec := brokercore.Capability{
+		SourceVaultID: scope.VaultID,
+		ActorUserID:   scope.UserID,
+		ActorAgentID:  scope.AgentID,
+		SourceSessID:  scope.SourceSessID,
+		VaultRole:     scope.VaultRole,
+		VaultName:     scope.VaultName,
+		Method:        bind.Method,
+		Scheme:        bind.Scheme,
+		Authority:     bind.Authority,
+		EscapedPath:   bind.EscapedPath,
+		Query:         bind.Query,
+		Snapshot:      brokercore.SnapshotFromService(matched),
+	}
+	contToken, err := p.caps.IssueContinuation(r.Context(), contRec)
+	if err != nil || contToken == "" {
+		brokercore.WriteProxyError(w, http.StatusBadGateway, "filter_misconfigured",
+			"Failed to issue filter continuation.")
+		emit(http.StatusBadGateway, "filter_misconfigured")
+		return
+	}
+
+	var polToken string
+	if pvName := matched.Filter.PolicyVault; pvName != "" {
+		polRec := contRec
+		polRec.Snapshot = brokercore.MatchSnapshot{Version: 1}
+		if pvName == scope.VaultName {
+			polRec.PolicyVaultID = scope.VaultID
+			polRec.PolicyVaultName = scope.VaultName
+		} else if lu, ok := p.sessions.(vaultLookup); ok {
+			v, verr := lu.LookupVault(r.Context(), pvName)
+			if verr != nil || v == nil {
+				brokercore.WriteProxyError(w, http.StatusBadGateway, "filter_misconfigured",
+					"Filter policy_vault could not be resolved.")
+				emit(http.StatusBadGateway, "filter_misconfigured")
+				return
+			}
+			polRec.PolicyVaultID = v.ID
+			polRec.PolicyVaultName = v.Name
+		} else {
+			brokercore.WriteProxyError(w, http.StatusBadGateway, "filter_misconfigured",
+				"Filter policy_vault could not be resolved.")
+			emit(http.StatusBadGateway, "filter_misconfigured")
 			return
 		}
+		polToken, err = p.caps.IssuePolicy(r.Context(), polRec)
+		if err != nil || polToken == "" {
+			brokercore.WriteProxyError(w, http.StatusBadGateway, "filter_misconfigured",
+				"Failed to issue filter policy capability.")
+			emit(http.StatusBadGateway, "filter_misconfigured")
+			return
+		}
+	}
+
+	proxyURL := p.advertisedProxyURL()
+	caPEM := ""
+	if p.ca != nil {
+		caPEM = strings.ReplaceAll(string(p.RootPEM()), "\n", "")
 	}
 
 	rp := &httputil.ReverseProxy{
@@ -129,21 +175,19 @@ func (p *Proxy) reverseProxyToFilter(
 			pr.Out.Host = origURL.Host
 			stripFilterHopHeaders(pr.Out.Header)
 			pr.Out.Header.Set(brokercore.HeaderOriginalURL, origURL.String())
-			if rawToken != "" {
-				pr.Out.Header.Set(brokercore.HeaderFilterToken, rawToken)
+			pr.Out.Header.Set(brokercore.HeaderContinuationProxy, proxyURL)
+			pr.Out.Header.Set(brokercore.HeaderContinuationToken, contToken)
+			if polToken != "" {
+				pr.Out.Header.Set(brokercore.HeaderPolicyProxy, proxyURL)
+				pr.Out.Header.Set(brokercore.HeaderPolicyToken, polToken)
 			}
-			if nonce != "" {
-				pr.Out.Header.Set(brokercore.HeaderFilterNonce, nonce)
+			if caPEM != "" {
+				pr.Out.Header.Set(brokercore.HeaderCA, caPEM)
 			}
 			pr.Out.Header.Set(brokercore.HeaderService, matched.Name)
-			vault := matched.Filter.Vault
-			if vault == "" {
-				vault = scope.VaultName
-			}
-			pr.Out.Header.Set(brokercore.HeaderFilterVault, vault)
 		},
-		FlushInterval: -1, // stream immediately (git packfiles, WS)
-		Transport:     p.filterTransport,
+		FlushInterval: -1,
+		Transport:     filterTransport(matched.Filter),
 		ErrorHandler: func(rw http.ResponseWriter, req *http.Request, e error) {
 			status := http.StatusBadGateway
 			code := "filter_unreachable"
@@ -156,6 +200,7 @@ func (p *Proxy) reverseProxyToFilter(
 			emit(status, code)
 		},
 		ModifyResponse: func(resp *http.Response) error {
+			stripAgentVaultResponseHeaders(resp.Header)
 			emit(resp.StatusCode, "")
 			return nil
 		},
@@ -163,9 +208,28 @@ func (p *Proxy) reverseProxyToFilter(
 	rp.ServeHTTP(w, r)
 }
 
+func (p *Proxy) advertisedProxyURL() string {
+	if p.filterProxyURL != "" {
+		return p.filterProxyURL
+	}
+	addr := p.boundAddr
+	if addr == "" {
+		addr = p.httpServer.Addr
+	}
+	return "http://" + addr
+}
+
 func stripFilterHopHeaders(h http.Header) {
 	for name := range h {
 		if brokercore.IsBrokerScopedRequestHeader(name) {
+			h.Del(name)
+		}
+	}
+}
+
+func stripAgentVaultResponseHeaders(h http.Header) {
+	for name := range h {
+		if strings.HasPrefix(http.CanonicalHeaderKey(name), "X-Agent-Vault-") {
 			h.Del(name)
 		}
 	}

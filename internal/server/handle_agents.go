@@ -59,11 +59,6 @@ func (s *Server) handleAgentCreate(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, "Agent name must be 3-64 characters, lowercase alphanumeric and hyphens only")
 		return
 	}
-	if broker.IsReservedFilterAgentName(req.Name) {
-		jsonError(w, http.StatusBadRequest, reservedFilterAgentNameError(req.Name))
-		return
-	}
-
 	type resolvedVault struct {
 		VaultID   string
 		VaultName string
@@ -402,11 +397,6 @@ func (s *Server) handleAgentRename(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, "Agent name must be 3-64 characters, lowercase alphanumeric and hyphens only")
 		return
 	}
-	if broker.IsReservedFilterAgentName(body.Name) {
-		jsonError(w, http.StatusBadRequest, reservedFilterAgentNameError(body.Name))
-		return
-	}
-
 	existing, _ := s.store.GetAgentByName(ctx, body.Name)
 	if existing != nil {
 		jsonError(w, http.StatusConflict, fmt.Sprintf("An agent named %q already exists", body.Name))

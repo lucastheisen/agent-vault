@@ -105,14 +105,14 @@ func TestSmoke_FilterLayoutA(t *testing.T) {
 		}
 		body, _ := io.ReadAll(r.Body)
 		orig := r.Header.Get(brokercore.HeaderOriginalURL)
-		token := r.Header.Get(brokercore.HeaderFilterToken)
-		ticket := r.Header.Get(brokercore.HeaderFilterNonce)
+		polToken := r.Header.Get(brokercore.HeaderPolicyToken)
+		contToken := r.Header.Get(brokercore.HeaderContinuationToken)
 		if r.Header.Get("Authorization") != "" {
 			t.Errorf("origin credential leaked onto filter hop: %q", r.Header.Get("Authorization"))
 		}
 		ref := smokeRefRE.FindStringSubmatch(string(body))
 		repo := smokePackRE.FindStringSubmatch(orig)
-		if len(ref) < 2 || len(repo) < 3 || token == "" || ticket == "" {
+		if len(ref) < 2 || len(repo) < 3 || polToken == "" || contToken == "" {
 			writeSmokeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad_filter_input"})
 			return
 		}
@@ -125,7 +125,7 @@ func TestSmoke_FilterLayoutA(t *testing.T) {
 		prot.Path = "/repos/" + repo[1] + "/" + repo[2] + "/branches/" + ref[1] + "/protection"
 		prot.RawQuery = ""
 
-		st, _, err := smokeProxyDo(proxy, token+":default", http.MethodGet, prot.String(), nil)
+		st, _, err := smokeProxyDo(proxy, polToken, http.MethodGet, prot.String(), nil)
 		if err != nil {
 			writeSmokeJSON(w, http.StatusBadGateway, map[string]string{"error": "protection_lookup_failed"})
 			return
@@ -144,7 +144,7 @@ func TestSmoke_FilterLayoutA(t *testing.T) {
 			return
 		}
 
-		st, out, err := smokeProxyDo(proxy, ticket, http.MethodPost, orig, body)
+		st, out, err := smokeProxyDo(proxy, contToken, http.MethodPost, orig, body)
 		if err != nil {
 			writeSmokeJSON(w, http.StatusBadGateway, map[string]string{"error": "continuation_failed"})
 			return
@@ -190,12 +190,9 @@ func TestSmoke_FilterLayoutA(t *testing.T) {
 			Path:     "/*/git-receive-pack",
 			Port:     &originPortInt,
 			Auth:     broker.Auth{Type: "bearer", Token: "GITHUB_TOKEN"},
-			Filter:   &broker.Filter{URL: sidecar.URL},
+			Filter:   &broker.Filter{URL: sidecar.URL, PolicyVault: "default"},
 			FilterOp: broker.FilterOpSet,
 		},
-	}
-	if err := srv.provisionFilters(ctx, "owner-user-id", vault, svcs); err != nil {
-		t.Fatalf("provisionFilters: %v", err)
 	}
 	raw, err := json.Marshal(svcs)
 	if err != nil {
@@ -223,8 +220,7 @@ func TestSmoke_FilterLayoutA(t *testing.T) {
 		CA:           caProv,
 		Sessions:     srv.SessionResolver(),
 		Credentials:  srv.CredentialProvider(),
-		Tickets:      srv.TicketSigner(),
-		FilterTokens: srv,
+		Capabilities: srv.Capabilities(),
 		BaseURL:      srv.BaseURL(),
 		Logger:       srv.Logger(),
 		RateLimit:    srv.RateLimit(),

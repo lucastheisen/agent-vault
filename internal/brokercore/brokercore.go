@@ -28,12 +28,16 @@ const DefaultMaxResponseBytes int64 = 0
 const ProxyErrorHeader = "X-Agent-Vault-Proxy-Error"
 
 // Hop headers Agent Vault sets on the reverse-proxy to a service filter.
+// Secrets are never placed in URLs — tokens travel in dedicated headers.
 const (
-	HeaderOriginalURL = "X-Agent-Vault-Original-URL"
-	HeaderFilterToken = "X-Agent-Vault-Filter-Token"
-	HeaderFilterNonce = "X-Agent-Vault-Filter-Nonce"
-	HeaderService     = "X-Agent-Vault-Service"
-	HeaderFilterVault = "X-Agent-Vault-Filter-Vault"
+	HeaderOriginalURL       = "X-Agent-Vault-Original-URL"
+	HeaderContinuationProxy = "X-Agent-Vault-Continuation-Proxy"
+	HeaderContinuationToken = "X-Agent-Vault-Continuation-Token"
+	HeaderPolicyProxy       = "X-Agent-Vault-Policy-Proxy"
+	HeaderPolicyToken       = "X-Agent-Vault-Policy-Token"
+	HeaderCA                = "X-Agent-Vault-CA"
+	HeaderService           = "X-Agent-Vault-Service"
+	headerPrefix            = "X-Agent-Vault-"
 )
 
 // HopByHopHeaders are HTTP/1.1 hop-by-hop headers that must not be
@@ -82,18 +86,17 @@ func IsValidHost(h string) bool {
 var brokerScopedRequestHeaders = map[string]bool{
 	"X-Vault":             true,
 	"Proxy-Authorization": true,
-	HeaderOriginalURL:     true,
-	HeaderFilterToken:     true,
-	HeaderFilterNonce:     true,
-	HeaderService:         true,
-	HeaderFilterVault:     true,
 }
 
 // IsBrokerScopedRequestHeader reports whether a request header
-// authenticates the client to Agent Vault itself and must be stripped
-// before forwarding to the target service.
+// authenticates the client to Agent Vault itself or is an Agent Vault
+// hop header, and must be stripped before forwarding to the origin.
 func IsBrokerScopedRequestHeader(name string) bool {
-	return brokerScopedRequestHeaders[http.CanonicalHeaderKey(name)]
+	ck := http.CanonicalHeaderKey(name)
+	if brokerScopedRequestHeaders[ck] {
+		return true
+	}
+	return strings.HasPrefix(ck, headerPrefix)
 }
 
 // ApplyInjection writes outbound headers for a resolved InjectResult.
@@ -168,7 +171,8 @@ func ForbiddenHintBody(targetHost, vaultName, baseURL string) map[string]interfa
 // Stripping Set-Cookie prevents the upstream from planting cookies in the
 // agent's jar.
 func ShouldStripResponseHeader(name string) bool {
-	return IsHopByHop(name) || strings.EqualFold(name, "Set-Cookie")
+	ck := http.CanonicalHeaderKey(name)
+	return IsHopByHop(ck) || strings.EqualFold(ck, "Set-Cookie") || strings.HasPrefix(ck, headerPrefix)
 }
 
 // WriteProxyError writes a JSON error response with Content-Type, the

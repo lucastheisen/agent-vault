@@ -2,7 +2,6 @@ package brokercore
 
 import (
 	"context"
-	"strings"
 	"time"
 
 	"github.com/Infisical/agent-vault/internal/store"
@@ -28,17 +27,21 @@ type ProxyScope struct {
 	VaultName string
 	VaultRole string
 
-	// SkipFilter is set when this hop must not reverse-proxy to a
-	// sidecar (HMAC continuation ticket, or the minted filter-agent).
+	// SkipFilter is set for a valid continuation capability: match
+	// was frozen at hop start; do not reverse-proxy to the sidecar.
 	SkipFilter bool
-	// FilterAgentID is the minted filter-agent this continuation was
-	// issued for. Empty on normal sessions.
-	FilterAgentID string
-	// Continuation is non-nil when auth was an HMAC ticket. MITM checks
-	// that this request's method/host/path match the claims, then
-	// injects inbound-vault credentials. The body is this request's
-	// body (from the sidecar), not a held copy of the first hop.
-	Continuation *ContinuationClaims
+	// IsPolicy is set when auth was a policy capability. Filtered
+	// services are denied (no nested filter hop).
+	IsPolicy bool
+	// Continuation is non-nil when auth was a continuation capability.
+	Continuation *Capability
+	// RawToken is the inbound bearer (capability or session). Used to
+	// consume a continuation and to re-check a policy cap on CONNECT.
+	RawToken string
+	// SourceSessID / SourceAgentID identify the initiating authority
+	// for capability revocation checks.
+	SourceSessID  string
+	SourceAgentID string
 }
 
 // ActorID returns the non-empty principal ID — UserID for user
@@ -71,9 +74,9 @@ type SessionStore interface {
 // StoreSessionResolver resolves sessions through a SessionStore. Now is
 // injectable so tests can control expiry without wall-clock flake.
 type StoreSessionResolver struct {
-	Store   SessionStore
-	Now     func() time.Time
-	Tickets *TicketSigner // nil = no continuation tickets
+	Store SessionStore
+	Now   func() time.Time
+	Caps  CapabilityStore // nil = no filter capabilities
 }
 
 // NewStoreSessionResolver constructs a resolver backed by s. If s is nil
@@ -89,12 +92,14 @@ func (r *StoreSessionResolver) ResolveForProxy(ctx context.Context, token, vault
 	if token == "" {
 		return nil, ErrInvalidSession
 	}
-	if r.Tickets != nil && strings.HasPrefix(token, ContinuationTokenPrefix) {
-		claims, err := r.Tickets.Parse(token)
+	if r.Caps != nil && IsCapabilityToken(token) {
+		c, err := r.Caps.Authenticate(ctx, token)
 		if err != nil {
 			return nil, err
 		}
-		return claims.Scope(), nil
+		scope := c.Scope()
+		scope.RawToken = token
+		return scope, nil
 	}
 	sess, err := r.Store.GetSession(ctx, token)
 	if err != nil || sess == nil {
@@ -119,11 +124,14 @@ func (r *StoreSessionResolver) ResolveForProxy(ctx context.Context, token, vault
 			return nil, ErrVaultHintMismatch
 		}
 		return &ProxyScope{
-			UserID:    sess.UserID,
-			AgentID:   sess.AgentID,
-			VaultID:   v.ID,
-			VaultName: v.Name,
-			VaultRole: sess.VaultRole,
+			UserID:        sess.UserID,
+			AgentID:       sess.AgentID,
+			VaultID:       v.ID,
+			VaultName:     v.Name,
+			VaultRole:     sess.VaultRole,
+			RawToken:      token,
+			SourceSessID:  store.HashSessionToken(token),
+			SourceAgentID: sess.AgentID,
 		}, nil
 	}
 
@@ -143,10 +151,13 @@ func (r *StoreSessionResolver) ResolveForProxy(ctx context.Context, token, vault
 			return nil, ErrVaultAccessDenied
 		}
 		return &ProxyScope{
-			AgentID:   sess.AgentID,
-			VaultID:   v.ID,
-			VaultName: v.Name,
-			VaultRole: role,
+			AgentID:       sess.AgentID,
+			VaultID:       v.ID,
+			VaultName:     v.Name,
+			VaultRole:     role,
+			RawToken:      token,
+			SourceSessID:  store.HashSessionToken(token),
+			SourceAgentID: sess.AgentID,
 		}, nil
 	}
 
@@ -160,12 +171,28 @@ func (r *StoreSessionResolver) ResolveForProxy(ctx context.Context, token, vault
 	case 1:
 		g := grants[0]
 		return &ProxyScope{
-			AgentID:   sess.AgentID,
-			VaultID:   g.VaultID,
-			VaultName: g.VaultName,
-			VaultRole: g.Role,
+			AgentID:       sess.AgentID,
+			VaultID:       g.VaultID,
+			VaultName:     g.VaultName,
+			VaultRole:     g.Role,
+			RawToken:      token,
+			SourceSessID:  store.HashSessionToken(token),
+			SourceAgentID: sess.AgentID,
 		}, nil
 	default:
 		return nil, ErrAgentVaultAmbiguous
 	}
+}
+
+// LookupVault returns a vault by name. Used when minting a policy
+// capability scoped to filter.policy_vault.
+func (r *StoreSessionResolver) LookupVault(ctx context.Context, name string) (*store.Vault, error) {
+	if r == nil || r.Store == nil || name == "" {
+		return nil, ErrVaultNotFound
+	}
+	v, err := r.Store.GetVault(ctx, name)
+	if err != nil || v == nil {
+		return nil, ErrVaultNotFound
+	}
+	return v, nil
 }

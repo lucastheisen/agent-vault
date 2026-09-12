@@ -167,6 +167,11 @@ func (s *Server) handleProposalCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	req.Services = normalized
 
+	if err := proposal.RejectFilteredDeletes(existing, req.Services); err != nil {
+		jsonError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	// Validate the proposal.
 	if err := proposal.Validate(req.Services, req.Credentials); err != nil {
 		jsonError(w, http.StatusBadRequest, err.Error())
@@ -527,6 +532,11 @@ func (s *Server) handleAdminProposalApprove(w http.ResponseWriter, r *http.Reque
 		writeNormalizeError(w, err, http.StatusConflict, http.StatusInternalServerError, func(host string) string {
 			return fmt.Sprintf("proposal targets host %q which no longer matches any service in this vault — reject the proposal manually", host)
 		})
+		return
+	}
+
+	if err := proposal.RejectFilteredDeletes(existingServices, proposedServices); err != nil {
+		jsonError(w, http.StatusConflict, err.Error())
 		return
 	}
 

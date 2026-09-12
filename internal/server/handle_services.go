@@ -430,7 +430,7 @@ func (s *Server) handleServicesUpsert(w http.ResponseWriter, r *http.Request) {
 		upserted = append(upserted, svc.Name)
 	}
 
-	if err := s.provisionFilters(ctx, actor.ID, ns, existing); err != nil {
+	if err := s.validateFilterWrites(ctx, actor.ID, ns, existing); err != nil {
 		jsonError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -445,7 +445,6 @@ func (s *Server) handleServicesUpsert(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusInternalServerError, "Failed to set services")
 		return
 	}
-	s.releaseUnusedFilterAgents(ctx)
 
 	s.captureEvent(r, "av.service-add", actor, map[string]string{"vault": name})
 	jsonOK(w, map[string]interface{}{
@@ -521,7 +520,6 @@ func (s *Server) handleServiceRemove(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusInternalServerError, "Failed to update services")
 		return
 	}
-	s.releaseUnusedFilterAgents(ctx)
 
 	s.captureEvent(r, "av.service-remove", actor, map[string]string{"vault": name})
 	jsonOK(w, map[string]interface{}{
@@ -666,7 +664,7 @@ func (s *Server) handleServicesSet(w http.ResponseWriter, r *http.Request) {
 	}
 	defer unlock()
 
-	if err := s.provisionFilters(ctx, actor.ID, ns, services); err != nil {
+	if err := s.validateFilterWrites(ctx, actor.ID, ns, services); err != nil {
 		jsonError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -681,7 +679,6 @@ func (s *Server) handleServicesSet(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusInternalServerError, "Failed to set services")
 		return
 	}
-	s.releaseUnusedFilterAgents(ctx)
 
 	jsonOK(w, map[string]interface{}{"vault": name, "services_count": len(services)})
 }
@@ -712,7 +709,6 @@ func (s *Server) handleServicesClear(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusInternalServerError, "Failed to clear services")
 		return
 	}
-	s.releaseUnusedFilterAgents(ctx)
 
 	jsonOK(w, map[string]interface{}{"vault": name, "cleared": true})
 }

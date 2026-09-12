@@ -172,6 +172,24 @@ func (p *StoreCredentialProvider) Inject(ctx context.Context, vaultID, targetHos
 		}
 		return &InjectResult{Passthrough: true}, nil
 	}
+	return p.resolveService(ctx, vaultID, matched, score)
+}
+
+// InjectFrozen resolves credentials from a frozen-match snapshot without
+// re-running the service matcher. Unknown snapshot versions fail closed
+// with no dest decrypt.
+func (p *StoreCredentialProvider) InjectFrozen(ctx context.Context, vaultID string, snap MatchSnapshot) (*InjectResult, error) {
+	if snap.Version != matchSnapshotVersion {
+		return nil, ErrInvalidSession
+	}
+	if snap.ServiceName == "" || snap.Host == "" {
+		return nil, ErrInvalidSession
+	}
+	svc := snap.Service()
+	return p.resolveService(ctx, vaultID, &svc, broker.MatchScore{})
+}
+
+func (p *StoreCredentialProvider) resolveService(ctx context.Context, vaultID string, matched *broker.Service, score broker.MatchScore) (*InjectResult, error) {
 	if !matched.IsEnabled() {
 		return nil, ErrServiceDisabled
 	}

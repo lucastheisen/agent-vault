@@ -1,17 +1,12 @@
 package broker
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/url"
 	"strings"
 )
-
-// FilterAgentNamePrefix is the reserved agent-name prefix for mint-at-config
-// filter agents. Human `agent create` / rename must reject it.
-const FilterAgentNamePrefix = "filter-"
 
 // FilterOp records how an incoming JSON write treated the filter field.
 // It is not persisted; UnmarshalJSON sets it so upsert can distinguish
@@ -26,42 +21,17 @@ const (
 )
 
 // Filter is an optional out-of-process sidecar hop on a matched service.
-// After match and before credential inject, Agent Vault reverse-proxies
-// the live request to URL.
+// After match and before destination credential resolve, Agent Vault
+// reverse-proxies the live request to URL.
 type Filter struct {
-	URL     string `json:"url" yaml:"url"`
-	Vault   string `json:"vault,omitempty" yaml:"vault,omitempty"`
-	AgentID string `json:"agent_id,omitempty" yaml:"-"`
+	URL                      string `json:"url" yaml:"url"`
+	PolicyVault              string `json:"policy_vault,omitempty" yaml:"policy_vault,omitempty"`
+	AllowInsecurePrivateHTTP bool   `json:"allow_insecure_private_http,omitempty" yaml:"allow_insecure_private_http,omitempty"`
 }
 
 // HasActiveFilter reports whether s declares a sidecar hop.
 func (s *Service) HasActiveFilter() bool {
 	return s != nil && s.Filter != nil && s.Filter.URL != ""
-}
-
-// FilterAgentName is the deterministic agent slug for a (filter.vault, url)
-// pair so services share one agent. Truncates the vault portion so the
-// result always passes ValidateSlug (≤64 chars).
-func FilterAgentName(vaultName, filterURL string) string {
-	sum := sha256.Sum256([]byte(filterURL))
-	hash := hex.EncodeToString(sum[:])[:8]
-	const prefix = FilterAgentNamePrefix
-	// prefix + hash + two hyphens reserved; vault gets the remainder.
-	budget := 64 - len(prefix) - 1 - len(hash)
-	v := vaultName
-	if len(v) > budget {
-		v = v[:budget]
-	}
-	v = strings.Trim(v, "-")
-	if v == "" {
-		v = "v"
-	}
-	return prefix + v + "-" + hash
-}
-
-// IsReservedFilterAgentName reports whether name uses the minted-agent prefix.
-func IsReservedFilterAgentName(name string) bool {
-	return strings.HasPrefix(name, FilterAgentNamePrefix)
 }
 
 // ValidateFilter checks a set filter. Empty URL is treated as clear by
@@ -80,17 +50,30 @@ func ValidateFilter(f *Filter) error {
 	if u.Host == "" {
 		return fmt.Errorf("filter.url must include a host")
 	}
-	if f.Vault != "" {
-		if err := ValidateSlug(f.Vault); err != nil {
-			return fmt.Errorf("filter.vault: %w", err)
+	if u.Scheme == "http" && !FilterHTTPHostAllowed(u.Hostname(), f.AllowInsecurePrivateHTTP) {
+		return fmt.Errorf("filter.url http is only allowed for a literal loopback IP, or with allow_insecure_private_http for a private/loopback host")
+	}
+	if f.PolicyVault != "" {
+		if err := ValidateSlug(f.PolicyVault); err != nil {
+			return fmt.Errorf("filter.policy_vault: %w", err)
 		}
 	}
 	return nil
 }
 
+// FilterHTTPHostAllowed reports whether an http filter.url host is
+// permitted. Literal loopback IPs are always allowed. Other hosts
+// require the insecure-private opt-in (resolved-address checks happen
+// at dial time).
+func FilterHTTPHostAllowed(hostname string, allowInsecurePrivate bool) bool {
+	if ip := net.ParseIP(hostname); ip != nil && ip.IsLoopback() {
+		return true
+	}
+	return allowInsecurePrivate
+}
+
 // ApplyFilterWrite copies incoming onto dst according to FilterOp.
-// Omit keeps dst.Filter; Clear nils it; Set replaces it (AgentID is
-// kept when the incoming URL+vault still match so minting can reuse).
+// Omit keeps dst.Filter; Clear nils it; Set replaces it.
 func ApplyFilterWrite(dst *Service, incoming Service) {
 	switch incoming.FilterOp {
 	case FilterOpOmit:
@@ -99,15 +82,7 @@ func ApplyFilterWrite(dst *Service, incoming Service) {
 		dst.Filter = nil
 		dst.FilterOp = FilterOpClear
 	case FilterOpSet:
-		prev := dst.Filter
-		next := incoming.Filter
-		if next != nil && prev != nil && next.AgentID == "" &&
-			next.URL == prev.URL && next.Vault == prev.Vault {
-			cloned := *next
-			cloned.AgentID = prev.AgentID
-			next = &cloned
-		}
-		dst.Filter = next
+		dst.Filter = incoming.Filter
 		dst.FilterOp = FilterOpSet
 	}
 }
@@ -149,7 +124,7 @@ func (s *Service) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(w.Filter, &f); err != nil {
 		return fmt.Errorf("filter: %w", err)
 	}
-	if f.URL == "" && f.Vault == "" && f.AgentID == "" {
+	if f.URL == "" && f.PolicyVault == "" && !f.AllowInsecurePrivateHTTP {
 		s.Filter = nil
 		s.FilterOp = FilterOpClear
 		return nil
@@ -157,4 +132,20 @@ func (s *Service) UnmarshalJSON(data []byte) error {
 	s.Filter = &f
 	s.FilterOp = FilterOpSet
 	return nil
+}
+
+// CredentialKeyNames returns the credential key names referenced by
+// auth and substitutions — never values. Used in frozen-match snapshots.
+func (s Service) CredentialKeyNames() []string {
+	return s.CredentialKeys()
+}
+
+// IsLoopbackHost reports whether host is a literal loopback IP (no DNS).
+func IsLoopbackHost(host string) bool {
+	h := host
+	if strings.HasPrefix(h, "[") && strings.HasSuffix(h, "]") {
+		h = strings.TrimSuffix(strings.TrimPrefix(h, "["), "]")
+	}
+	ip := net.ParseIP(h)
+	return ip != nil && ip.IsLoopback()
 }

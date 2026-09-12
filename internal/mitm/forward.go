@@ -1,6 +1,7 @@
 package mitm
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -238,12 +239,36 @@ func (p *Proxy) forwardRequest(
 		return
 	}
 
+	if scope.IsPolicy && p.caps != nil && scope.RawToken != "" {
+		if _, err := p.caps.Authenticate(r.Context(), scope.RawToken); err != nil {
+			brokercore.WriteProxyError(w, http.StatusForbidden, "filter_misconfigured",
+				"Policy capability is no longer valid.")
+			emit(http.StatusForbidden, "filter_misconfigured")
+			return
+		}
+	}
+
 	if c := scope.Continuation; c != nil {
-		if !strings.EqualFold(c.Method, r.Method) || !strings.EqualFold(c.Host, host) || c.Path != r.URL.Path {
+		path := r.URL.EscapedPath()
+		if path == "" {
+			path = r.URL.Path
+		}
+		if !c.BindMatches(r.Method, hostHeaderForScheme(scheme, target), path, r.URL.RawQuery, scheme) {
 			brokercore.WriteProxyError(w, http.StatusForbidden, "filter_ticket_mismatch",
-				"Continuation ticket does not match this request.")
+				"Continuation does not match this request.")
 			emit(http.StatusForbidden, "filter_ticket_mismatch")
 			return
+		}
+		if p.caps != nil && scope.RawToken != "" {
+			consumed, err := p.caps.ConsumeContinuation(r.Context(), scope.RawToken)
+			if err != nil {
+				brokercore.WriteProxyError(w, http.StatusForbidden, "filter_ticket_mismatch",
+					"Continuation is invalid or already used.")
+				emit(http.StatusForbidden, "filter_ticket_mismatch")
+				return
+			}
+			c = consumed
+			scope.Continuation = consumed
 		}
 	}
 
@@ -251,7 +276,19 @@ func (p *Proxy) forwardRequest(
 		return
 	}
 
-	inject, err := p.creds.Inject(r.Context(), scope.VaultID, host, port, r.URL.Path)
+	var inject *brokercore.InjectResult
+	var err error
+	if c := scope.Continuation; c != nil {
+		if frozen, ok := p.creds.(interface {
+			InjectFrozen(context.Context, string, brokercore.MatchSnapshot) (*brokercore.InjectResult, error)
+		}); ok {
+			inject, err = frozen.InjectFrozen(r.Context(), scope.VaultID, c.Snapshot)
+		} else {
+			inject, err = p.creds.Inject(r.Context(), scope.VaultID, host, port, r.URL.Path)
+		}
+	} else {
+		inject, err = p.creds.Inject(r.Context(), scope.VaultID, host, port, r.URL.Path)
+	}
 	if inject != nil {
 		event.MatchedService = inject.MatchedName
 		event.MatchedHost = inject.MatchedHost

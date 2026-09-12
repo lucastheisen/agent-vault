@@ -62,7 +62,7 @@ type Server struct {
 	httpServer    *http.Server
 	store         Store
 	encKey        []byte // 32-byte encryption key, held in memory while running
-	tickets       *brokercore.TicketSigner
+	caps          brokercore.CapabilityStore
 	notifier      *notify.Notifier
 	initialized   bool                // true when at least one owner account exists
 	lastInitCheck atomic.Int64        // unix-millis of last DB check for initialization (throttle)
@@ -178,13 +178,13 @@ func (s *Server) captureEvent(r *http.Request, event string, actor *Actor, extra
 // server's store.
 func (s *Server) SessionResolver() brokercore.SessionResolver {
 	r := brokercore.NewStoreSessionResolver(s.store)
-	r.Tickets = s.tickets
+	r.Caps = s.caps
 	return r
 }
 
-// TicketSigner returns the process-local HMAC signer for filter continuation tickets.
-func (s *Server) TicketSigner() *brokercore.TicketSigner {
-	return s.tickets
+// Capabilities returns the filter capability store (shared SQL or memory).
+func (s *Server) Capabilities() brokercore.CapabilityStore {
+	return s.caps
 }
 
 // CredentialProvider returns a brokercore.CredentialProvider backed by
@@ -795,7 +795,7 @@ func New(addr string, store Store, encKey []byte, notifier *notify.Notifier, ini
 		},
 		store:          store,
 		encKey:         encKey,
-		tickets:        newTicketSigner(),
+		caps:           newCapabilityStore(store),
 		notifier:       notifier,
 		initialized:    initialized,
 		baseURL:        strings.TrimRight(baseURL, "/"),
@@ -985,6 +985,7 @@ func New(addr string, store Store, encKey []byte, notifier *notify.Notifier, ini
 	mux.HandleFunc("GET /account/{path...}", s.handleSPA)
 	mux.HandleFunc("GET /{$}", s.handleSPA)
 
+	s.wireCapabilityCheck()
 	return s
 }
 

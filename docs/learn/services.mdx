@@ -258,9 +258,9 @@ Substitutions and auth are independent. A service can use either, both, or neith
 
 ## Request filters
 
-A **filter** is an optional sidecar hop on a matched service. After Agent Vault matches the service and **before** it injects credentials, it reverse-proxies the live request to `filter.url`. The sidecar may return any HTTP response to the client (including 403) or complete the call through Agent Vault: either as the minted filter-agent, or with a one-shot continuation ticket on a **new** request to the same method/host/path (the ticket does not hold the original body).
+A **filter** is an optional sidecar hop on a matched service. After Agent Vault matches the service and **before** it injects destination credentials, it reverse-proxies the live request to `filter.url`. The sidecar may return any HTTP response to the client (including 403) or continue through Agent Vault with short-lived capabilities: a single-use **continuation** for the exact original URL, and an optional **policy** capability when `policy_vault` is set.
 
-Filters are an operator implementation detail: they do not appear on `/discover`, cannot be set by [proposals](/learn/proposals), and have no CLI flags (YAML-only, same as substitutions).
+Filters are an operator implementation detail: they do not appear on `/discover`, cannot be set or deleted by [proposals](/learn/proposals), and have no CLI flags (YAML-only, same as substitutions). The sidecar is not a vault object and not an agent.
 
 ```yaml
 services:
@@ -271,14 +271,15 @@ services:
       token: GITHUB_TOKEN
     filter:
       url: http://127.0.0.1:12345
-      vault: policy   # optional; defaults to this service's vault
+      policy_vault: default   # optional; omit = no policy capability
 ```
 
-- `url` — http(s) origin of the sidecar (loopback is allowed on this hop).
-- `vault` — vault the minted `filter-…` agent is granted **proxy** on. Omit to use the same vault (logic in front of the same credentials).
-- Agent Vault mints a visible agent named `filter-<vault>-<hash>` (the `filter-` prefix is reserved) and shares it across services with the same `url` + `vault`.
+- `url` — sidecar origin. `https` is the default. Literal-loopback `http` is allowed. Non-loopback `http` requires `allow_insecure_private_http: true` (RFC1918/loopback only; IMDS and public cleartext stay blocked).
+- `policy_vault` — vault the 30s policy capability is scoped to. **Omitted means no policy capability.** Set to the source vault name for same-vault side-channel calls (Layout A). A different vault requires admin on both vaults (Layout B).
+- Continuation is single-use, bound to the exact method/URL, and resolves the **frozen** match (credential **key names** from hop start; current values at consume). Policy capabilities cannot invoke any filtered service.
 - `vault service add` **preserves** a filter when YAML omits `filter`. Clear with `filter: {}` or `filter: null`. **`vault service set` / `clear` replace the list** and drop omitted filters.
-- If the sidecar is down or the filter-agent is revoked, the client request fails closed (502/504). Re-apply the YAML to remint a revoked filter-agent.
+- Remote sidecars that must call back through Agent Vault need `AGENT_VAULT_FILTER_PROXY_URL`. Local sidecars use the process's loopback MITM listener.
+- If the sidecar is down or a capability cannot be issued, the client request fails closed (502/504). Revoking the inbound agent or session immediately invalidates outstanding capabilities.
 
 ## Matching rules
 

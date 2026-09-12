@@ -43,6 +43,10 @@ func MergeServices(existing []broker.Service, proposed []Service) ([]broker.Serv
 				warnings = append(warnings, fmt.Sprintf("skipped delete for %q: service not found", p.Name))
 				continue
 			}
+			if merged[idx].HasActiveFilter() {
+				warnings = append(warnings, fmt.Sprintf("refused delete of filtered service %q", p.Name))
+				continue
+			}
 			removeSet[idx] = true
 			delete(nameIndex, p.Name)
 
@@ -82,6 +86,24 @@ func MergeServices(existing []broker.Service, proposed []Service) ([]broker.Serv
 	}
 
 	return merged, warnings
+}
+
+// RejectFilteredDeletes returns an error if any proposed delete targets a
+// service that currently has an active filter.
+func RejectFilteredDeletes(existing []broker.Service, proposed []Service) error {
+	byName := make(map[string]broker.Service, len(existing))
+	for _, s := range existing {
+		byName[s.Name] = s
+	}
+	for _, p := range proposed {
+		if p.Action != ActionDelete {
+			continue
+		}
+		if svc, ok := byName[p.Name]; ok && svc.HasActiveFilter() {
+			return fmt.Errorf("cannot delete filtered service %q via proposal", p.Name)
+		}
+	}
+	return nil
 }
 
 func toBrokerService(p Service) broker.Service {
