@@ -179,6 +179,13 @@ func (s *Server) SessionResolver() brokercore.SessionResolver {
 	return brokercore.NewStoreSessionResolver(s.store)
 }
 
+// SourceAuthorityChecker re-validates the session or agent a filter
+// capability was minted from. Same resolver, narrower contract, exposed
+// separately so the MITM proxy takes only the surface it needs.
+func (s *Server) SourceAuthorityChecker() brokercore.SourceAuthorityChecker {
+	return brokercore.NewStoreSessionResolver(s.store)
+}
+
 // CredentialProvider returns a brokercore.CredentialProvider backed by
 // this server's store and encryption key.
 func (s *Server) CredentialProvider() brokercore.CredentialProvider {
@@ -1089,6 +1096,7 @@ func (s *Server) Start() error {
 	pruneCtx, stopWorkers := context.WithCancel(context.Background())
 	defer stopWorkers()
 	go s.runTouchCachePruner(pruneCtx)
+	go s.runFilterCapabilitySweeper(pruneCtx)
 
 	// syncerDone closes once Syncer.Run has returned AND drained its in-flight
 	// refresh goroutines. We block on it before WipeBytes so a refresh mid-
@@ -1373,6 +1381,35 @@ func (s *Server) pruneTouchCache() {
 		}
 		return true
 	})
+}
+
+// filterCapabilitySweepInterval is how often expired capability rows are
+// swept. Correctness never depends on the sweep — every read re-checks
+// expiry — so the interval only needs to keep a table with a 30-second
+// TTL from accumulating rows, not to be prompt.
+const filterCapabilitySweepInterval = 5 * time.Minute
+
+// runFilterCapabilitySweeper deletes expired filter capabilities until
+// ctx is cancelled. This is the first TTL-swept table in the schema;
+// sessions are only ever checked on read, never collected.
+func (s *Server) runFilterCapabilitySweeper(ctx context.Context) {
+	ticker := time.NewTicker(filterCapabilitySweepInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			n, err := s.store.DeleteExpiredFilterCapabilities(ctx, time.Now())
+			if err != nil {
+				s.logger.Debug("filter capability sweep failed", slog.String("error", err.Error()))
+				continue
+			}
+			if n > 0 {
+				s.logger.Debug("swept expired filter capabilities", slog.Int64("rows", n))
+			}
+		}
+	}
 }
 
 // runTouchCachePruner drives pruneTouchCache on a ticker until ctx is

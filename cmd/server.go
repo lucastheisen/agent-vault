@@ -229,6 +229,14 @@ func attachMITMIfEnabled(srv *server.Server, host string, mitmPort int, masterKe
 			LogSink:          srv.LogSink(),
 			MaxResponseBytes: maxRespBytes,
 			MaxRequestBytes:  maxReqBytes,
+			Filter: &mitm.FilterOptions{
+				Store:     db,
+				Authority: srv.SourceAuthorityChecker(),
+				// A sidecar that is not on this host cannot reach a
+				// loopback listener, so a remote deployment has to be
+				// told where to call back.
+				ProxyBaseURL: os.Getenv("AGENT_VAULT_FILTER_PROXY_URL"),
+			},
 		},
 	))
 	return nil
