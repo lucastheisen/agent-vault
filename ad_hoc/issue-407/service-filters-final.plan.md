@@ -236,6 +236,10 @@ Rows store a token **hash**. No credential values, no raw tokens, no reversible
 form of either. Audit and rate-limit attribution stay with the **initiating
 actor**, not the sidecar. This write happens only on the filtered path.
 
+Every filtered hop also receives a random, non-authorizing `invocation_id`.
+The continuation and optional policy row share it. It is correlation metadata,
+never a bearer and never sent to the sidecar as a capability.
+
 Capabilities authorize the MITM **data plane only**. They are accepted only as
 proxy credentials and never as bearer sessions on `/discover`, proposals,
 vault administration, or any other control-plane endpoint. Their effective
@@ -392,6 +396,7 @@ Contents — everything Resolve needs and nothing used only to decide whether to
 | Source vault id | |
 | Initiating actor + session hash and agent id | Audit and revocation |
 | Kind, token hash, expiry, issued/claimed/consumed | The FSM |
+| Invocation id | Shared by the continuation and optional policy row; correlation/cleanup only |
 | Exact request bind | method, scheme, authority, escaped path, raw query |
 | Canonical matched service | name, host, path, port |
 | Complete non-secret auth shape | `type`, header name, prefix, and the whole `custom.headers` template map — credential references stay key names |
@@ -422,13 +427,16 @@ non-secret. Never persist credential *values*.
 ### 5.7 Capability pairs are one invocation
 
 Resolve the policy-vault scope first, then insert both rows in **one
-transaction**. A partial pair must never become visible.
+transaction with the same `invocation_id`. A partial pair must never become
+visible. Index `invocation_id` so cleanup does not require retaining or
+re-presenting either raw bearer.
 
 If the sidecar is unreachable, times out, rejects without using the
 continuation, fails its WebSocket upgrade, or the filtered stream ends, retire
-every still-live capability for that invocation immediately, by hash or row id.
-Cleanup is best-effort defense in depth — expiry and validation remain
-mandatory — and a scheduled sweeper removes anything cleanup misses.
+every still-live capability for that invocation immediately with one
+`DELETE ... WHERE invocation_id = ?`. Cleanup is best-effort defense in depth —
+expiry and validation remain mandatory — and a scheduled sweeper removes
+anything cleanup misses.
 
 The sidecar contract is **synchronous**: returning its final response means the
 decision is complete. It may not retain a policy capability for asynchronous
@@ -448,8 +456,8 @@ Logging follows the same distinction:
 - the initial filter-hop row records matched service identity but no credential
   keys, because no credential was resolved;
 - the continuation origin row is attributed to the initiator and records the
-  frozen service/key names that were actually resolved, while correlating to
-  the filter invocation;
+  frozen service/key names that were actually resolved, correlated through the
+  non-secret invocation id;
 - policy calls are attributed to the initiator in the policy vault and record
   their own matched service/key names;
 - raw session/capability tokens and credential values never enter logs, spans,
@@ -643,9 +651,9 @@ an unfiltered GitHub write service in `policy_vault`.
 - `brokercore`: **Match** vs **Resolve** as required interface members; frozen
   match freeze/thaw with a version envelope; no dest decrypt on the filter path.
 - `store`: capability table with constraints on kind and state, indexes on token
-  hash, expiry, and source-session hash; the three-state FSM; transactional pair
-  minting; invocation correlation/retirement; scheduled sweep following the
-  existing ticker-until-context-cancel pattern.
+  hash, expiry, source-session hash, and invocation id; the three-state FSM;
+  transactional pair minting; invocation correlation/retirement; scheduled
+  sweep following the existing ticker-until-context-cancel pattern.
 - `mitm`: reverse-proxy to `filter.url`; admission-time claim on both ingress
   shapes; token-vs-proxy-URL headers; strip-then-set both directions; dedicated
   dialer; filtered WS reverse-proxy plus continuation bridge; capability tokens
@@ -692,7 +700,8 @@ an unfiltered GitHub write service in `policy_vault`.
 7. Inspect the real database: no column equals any live raw source-session,
    continuation, policy, or credential value.
 8. Force failure of the second row in pair issuance → neither row visible. Fail
-   or deny a hop → remaining invocation rows retired.
+   or deny a hop → all rows sharing its invocation id are retired by one
+   cleanup operation. The invocation id itself cannot authenticate a request.
    Source revocation racing pair issuance cannot produce a committed usable row.
 
 ### Frozen match, interfaces, no-read invariant
@@ -803,9 +812,10 @@ executed only on SQLite. Do not let it read as tested.
 13. Preserve on `service add` omit; wipe on `set`/`clear`. List prints `filter`.
 14. YAML only, following the substitutions precedent.
 15. Capabilities are shared DB TTL rows: token hash, three-state FSM with atomic
-    conditional updates, versioned frozen projection, source session hash.
-    Process-local storage is dev/single-instance only and never an implicit
-    production fallback. No capability write on the unfiltered path.
+    conditional updates, versioned frozen projection, source session hash, and
+    a shared non-authorizing invocation id. Process-local storage is
+    dev/single-instance only and never an implicit production fallback. No
+    capability write on the unfiltered path.
 16. Source revocation, expiry, or removal invalidates issued capabilities
     immediately — re-checked on policy auth, continuation consume, and every
     request inside a persistent CONNECT tunnel. Stricter than the unfiltered
@@ -832,7 +842,8 @@ executed only on SQLite. Do not let it read as tested.
     configuration without reading values — are removed before the sidecar.
     `Authorization` is **not** stripped unconditionally (§8.1).
 25. A continuation and its optional policy capability are minted in one
-    transaction and retired together; the sidecar contract is synchronous (§5.7).
+    transaction with one indexed, non-authorizing invocation id and retired
+    together; the sidecar contract is synchronous (§5.7).
 26. Filtered ingress is rate-limited once, continuation does not double-charge,
     and every policy request is charged; logs retain initiator/service/key-name
     attribution without raw tokens or values (§5.8).
