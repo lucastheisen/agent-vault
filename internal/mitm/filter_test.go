@@ -143,13 +143,6 @@ func (f *fakeCapStore) GetVaultByID(_ context.Context, id string) (*store.Vault,
 	return v, nil
 }
 
-func (f *fakeCapStore) live(rawToken string) bool {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	_, ok := f.rows[rawToken]
-	return ok
-}
-
 // fakeAuthority answers the revocation re-check from a closure, so a
 // test can revoke mid-flight.
 type fakeAuthority struct {
@@ -297,12 +290,6 @@ func newFilterHarnessFor(
 
 func (h *filterHarness) client() *http.Client {
 	return newTrustingClient(h.proxyURL, url.User(filterTestToken), h.clientRoots)
-}
-
-// capClient talks to the proxy using a capability token instead of a
-// session token.
-func (h *filterHarness) capClient(capToken string) *http.Client {
-	return newTrustingClient(h.proxyURL, url.User(capToken), h.clientRoots)
 }
 
 // --- tests -----------------------------------------------------------

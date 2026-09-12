@@ -28,8 +28,8 @@ package mitm
 
 import (
 	"context"
-	"log/slog"
 	"crypto/tls"
+	"log/slog"
 	"net"
 	"net/http"
 	"sync/atomic"
@@ -52,7 +52,7 @@ type Proxy struct {
 	upstream         *http.Transport
 	isListening      atomic.Bool
 	boundAddr        atomic.Value // string; the address actually bound, for :0 listeners
-	baseURL          string // externally-reachable control-plane URL for help links
+	baseURL          string       // externally-reachable control-plane URL for help links
 	logger           *slog.Logger
 	rateLimit        *ratelimit.Registry // shared with the HTTP server; nil = no-op
 	logSink          requestlog.Sink     // never nil (Nop default); shared with the HTTP server

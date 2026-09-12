@@ -8,7 +8,7 @@ LDFLAGS := -s -w \
 	-X github.com/Infisical/agent-vault/cmd.date=$(DATE) \
 	-X github.com/Infisical/agent-vault/cmd.posthogAPIKey=$(POSTHOG_API_KEY)
 
-.PHONY: build dev test lint coverage test-all clean docker web web-dev sdk-ts sdk-ts-test
+.PHONY: build dev test test-smoke lint coverage test-all clean docker web web-dev sdk-ts sdk-ts-test
 
 web:
 	cd web && npm ci && npm run build
@@ -39,6 +39,12 @@ dev: web
 
 test:
 	go test ./...
+
+# Opt-in end-to-end policy-filter hop: real SQLite store, real CA, real
+# MITM listener, real sidecar and origins. Build-tagged out of `test`
+# because it stands up the whole stack rather than exercising a package.
+test-smoke:
+	go test -tags smoke -count=1 ./internal/server/ -run '^TestSmoke_' -timeout 60s
 
 lint:
 	golangci-lint run ./...

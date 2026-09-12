@@ -420,16 +420,6 @@ func policyCapabilityMayUse(match *brokercore.CredentialMatch) bool {
 	return !match.HasFilter()
 }
 
-// continuationServiceMatches guards the frozen match against the service
-// the request would resolve to now.
-//
-// Only the identity is compared. Everything else about the service is
-// read from the snapshot, precisely so that an edit during the window
-// cannot retarget which credential slot gets attached.
-func continuationServiceMatches(frozen *brokercore.CredentialMatch, svcName string) bool {
-	return frozen != nil && frozen.Service != nil && frozen.Service.Name == svcName
-}
-
 // filterURLFor returns the parsed sidecar URL for a matched service.
 func filterURLFor(svc *broker.Service) (*url.URL, error) {
 	if !svc.HasFilter() {

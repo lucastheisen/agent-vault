@@ -198,6 +198,9 @@ func TestFilteredWebSocketBridged(t *testing.T) {
 
 		upstreamBuf := bufio.NewReader(upstream)
 		upResp, rerr := http.ReadResponse(upstreamBuf, &http.Request{Method: http.MethodGet})
+		if upResp != nil && upResp.Body != nil {
+			defer func() { _ = upResp.Body.Close() }()
+		}
 		if rerr != nil || upResp.StatusCode != http.StatusSwitchingProtocols {
 			fmt.Fprint(clientBuf, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
 			_ = clientBuf.Flush()
@@ -222,6 +225,7 @@ func TestFilteredWebSocketBridged(t *testing.T) {
 	clientKey := testWSKey()
 	conn, reader, resp := wsUpgradeThroughProxy(t, proxyURL, filterTestToken, origin.URL+"/ws", clientKey)
 	defer conn.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusSwitchingProtocols {
 		body, _ := io.ReadAll(resp.Body)
@@ -289,6 +293,7 @@ func TestUnfilteredWebSocketBypassesTheFilterEntirely(t *testing.T) {
 	clientKey := testWSKey()
 	conn, reader, resp := wsUpgradeThroughProxy(t, proxyURL, filterTestToken, origin.URL+"/ws", clientKey)
 	defer conn.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusSwitchingProtocols {
 		t.Fatalf("status = %d, want 101", resp.StatusCode)
