@@ -325,6 +325,13 @@ func (p *Proxy) forwardRequest(
 				emit(http.StatusBadGateway, errFilterMisconfigured)
 				return
 			}
+			// The hop resolves no credential, so the log row carries the
+			// matched service's identity and nothing about its keys —
+			// which is the honest record of what happened.
+			event.MatchedService = match.Service.Name
+			event.MatchedHost = match.Service.Host
+			event.MatchedPath = match.Service.Path
+			event.MatchedPort = match.Service.Port
 			p.serveFilterHop(w, r, target, scheme, outURL, scope, match, emit)
 			return
 		}
