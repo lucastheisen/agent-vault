@@ -11,6 +11,7 @@ import (
 
 	"github.com/Infisical/agent-vault/internal/brokercore"
 	"github.com/Infisical/agent-vault/internal/ratelimit"
+	"github.com/Infisical/agent-vault/internal/store"
 )
 
 // mitmIPKey is the rate-limit key for the per-IP flood gate shared by
@@ -80,11 +81,28 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		writeProxyAuthChallenge(w, "Proxy-Authorization required")
 		return
 	}
-	scope, err := p.sessions.ResolveForProxy(r.Context(), token, hint)
+	scope, capAuth, err := p.authenticateProxy(r, token, hint)
 	if err != nil {
 		p.recordAuthFailure(r)
 		writeAuthError(w, err)
 		return
+	}
+
+	// A continuation is bound to one exact request, but only its
+	// authority is knowable at CONNECT time — method, path, and query
+	// arrive inside the tunnel. Check the half we can: without this, a
+	// stolen continuation could open a tunnel to any host at all, and
+	// Agent Vault would mint a leaf certificate for that name and dial it
+	// before the bind check ever ran. Consumption still happens on the
+	// tunnelled request.
+	capToken := ""
+	if capAuth != nil {
+		capToken = capAuth.rawToken
+		if capAuth.kind == store.FilterCapContinuation && capAuth.record.Bind.Authority != target {
+			p.recordAuthFailure(r)
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
 	}
 
 	hj, ok := w.(http.Hijacker)
@@ -133,7 +151,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	// closes the listener so Serve returns.
 	listener := newOneShotListener(tlsConn)
 	srv := &http.Server{
-		Handler: p.forwardHandler(target, host, port, scope),
+		Handler: p.forwardHandler(target, host, port, proxyAuth{scope: scope, capToken: capToken}),
 		// ReadHeaderTimeout and ReadTimeout bound the request side
 		// (slow-loris defense). IdleTimeout caps keep-alives between
 		// requests. The upstream transport's ResponseHeaderTimeout
@@ -153,6 +171,37 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 	_ = srv.Serve(listener)
+}
+
+// proxyAuth is the authenticated context a forwarded request runs under.
+type proxyAuth struct {
+	scope *brokercore.ProxyScope
+
+	// capToken is the raw filter-capability token when the request, or
+	// the tunnel carrying it, authenticated with one rather than with a
+	// session.
+	//
+	// The raw token is kept rather than the resolved record on purpose:
+	// every request inside a tunnel re-resolves it, so revoking the
+	// originating session or agent takes effect on the next request
+	// instead of whenever the tunnel happens to close.
+	capToken string
+}
+
+// authenticateProxy resolves a Proxy-Authorization token to a scope.
+//
+// Dispatch is by token prefix, so a capability never falls through to
+// the session resolver or the other way round; an unknown prefix is a
+// session token and nothing else.
+func (p *Proxy) authenticateProxy(r *http.Request, token, hint string) (*brokercore.ProxyScope, *capabilityAuth, error) {
+	if capabilityKind(token) != "" {
+		if p.filter == nil {
+			return nil, nil, brokercore.ErrInvalidSession
+		}
+		return p.filter.authenticateCapability(r.Context(), token)
+	}
+	scope, err := p.sessions.ResolveForProxy(r.Context(), token, hint)
+	return scope, nil, err
 }
 
 // recordAuthFailure records one auth-failure event against the per-IP

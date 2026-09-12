@@ -122,7 +122,15 @@ func (f *fakeCredProvider) Match(_ context.Context, _, targetHost string, target
 	if res.result != nil && res.result.MatchedName != "" {
 		name = res.result.MatchedName
 	}
-	return &brokercore.CredentialMatch{Service: &broker.Service{Name: name, Host: host}}, nil
+	svc := &broker.Service{Name: name, Host: host}
+	// Carry the port so ResolveMatch can find a port-specific entry
+	// again; without it the synthesized match loses the distinction the
+	// byHostPort map exists to express.
+	if targetPort > 0 {
+		p := targetPort
+		svc.Port = &p
+	}
+	return &brokercore.CredentialMatch{Service: svc}, nil
 }
 
 func (f *fakeCredProvider) ResolveMatch(_ context.Context, _ string, m *brokercore.CredentialMatch) (*brokercore.InjectResult, error) {

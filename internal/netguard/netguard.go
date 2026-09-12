@@ -200,3 +200,82 @@ func SafeDialContext(allowPrivate bool) func(ctx context.Context, network, addr 
 		return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
 	}
 }
+
+// sidecarPrivateRanges is the address space a *cleartext* policy-filter
+// sidecar is allowed to live in.
+//
+// Narrower than privateRanges on purpose. It is loopback plus RFC-1918
+// (and the IPv6 equivalents, since a Compose or Kubernetes sidecar may
+// only have a ULA address), and deliberately excludes link-local and
+// carrier-grade NAT: those are not a trusted private network an operator
+// chose, they are what you get when something is misconfigured.
+var sidecarPrivateRanges = []net.IPNet{
+	// RFC-1918
+	parseCIDR("10.0.0.0/8"),
+	parseCIDR("172.16.0.0/12"),
+	parseCIDR("192.168.0.0/16"),
+	// Loopback
+	parseCIDR("127.0.0.0/8"),
+	parseCIDR("::1/128"),
+	// IPv6 unique local — the ULA analogue of RFC-1918
+	parseCIDR("fc00::/7"),
+}
+
+// IsPrivateSidecarIP reports whether ip is inside the address space a
+// cleartext filter sidecar may occupy. IMDS is rejected even though it
+// is not routable from outside, because a filter hop that could be
+// pointed at the metadata service would be an SSRF primitive with a
+// credential attached.
+func IsPrivateSidecarIP(ip net.IP) bool {
+	for _, n := range alwaysBlocked {
+		if n.Contains(ip) {
+			return false
+		}
+	}
+	for _, n := range sidecarPrivateRanges {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// PrivateOnlyDialContext returns a DialContext that connects only when
+// *every* address the target resolves to is private per
+// IsPrivateSidecarIP.
+//
+// Checking every answer rather than the first is what stops a name that
+// resolves to both 10.0.0.5 and a public address from being treated as
+// private; connecting to the already-validated IP rather than re-
+// resolving is what stops a DNS rebind between check and dial.
+//
+// It reads no environment: AGENT_VAULT_ALLOW_PRIVATE_RANGES governs
+// where *upstream origins* may live and has no say over where a policy
+// sidecar may live.
+func PrivateOnlyDialContext() func(ctx context.Context, network, addr string) (net.Conn, error) {
+	dialer := &net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, fmt.Errorf("netguard: invalid address %q: %w", addr, err)
+		}
+		ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+		if err != nil {
+			return nil, fmt.Errorf("netguard: DNS lookup failed for %q: %w", host, err)
+		}
+		if len(ips) == 0 {
+			return nil, fmt.Errorf("netguard: %q resolved to no addresses", host)
+		}
+		for _, ipAddr := range ips {
+			if !IsPrivateSidecarIP(ipAddr.IP) {
+				return nil, fmt.Errorf("netguard: cleartext filter hop to %s (%s) blocked — "+
+					"only loopback and private addresses may be reached over http",
+					host, ipAddr.IP.String())
+			}
+		}
+		return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
+	}
+}

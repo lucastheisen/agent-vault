@@ -52,14 +52,20 @@ var websocketHandshakeHeaderNames = []string{
 	"Upgrade",
 }
 
+// dialFunc matches net.Dialer.DialContext. The filter hop supplies its
+// own so a WebSocket upgrade to a sidecar travels the same restricted
+// transport as the plain-HTTP hop, rather than the origin transport.
+type dialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
+
 func (p *Proxy) forwardWebSocket(
 	w http.ResponseWriter,
 	r *http.Request,
 	outReq *http.Request,
 	wsSubs []brokercore.ResolvedSubstitution,
 	emit func(status int, errCode string),
+	dial dialFunc,
 ) {
-	upstreamConn, upstreamReader, resp, err := p.dialWebSocketUpstream(r.Context(), outReq)
+	upstreamConn, upstreamReader, resp, err := p.dialWebSocketUpstream(r.Context(), outReq, dial)
 	if err != nil {
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 		emit(http.StatusBadGateway, "upstream_error")
@@ -157,8 +163,12 @@ const wsIdleTimeout = 10 * time.Minute
 func (p *Proxy) dialWebSocketUpstream(
 	ctx context.Context,
 	outReq *http.Request,
+	dial dialFunc,
 ) (net.Conn, *bufio.Reader, *http.Response, error) {
-	dialCtx := p.upstream.DialContext
+	dialCtx := dial
+	if dialCtx == nil {
+		dialCtx = p.upstream.DialContext
+	}
 	if dialCtx == nil {
 		dialer := &net.Dialer{}
 		dialCtx = dialer.DialContext

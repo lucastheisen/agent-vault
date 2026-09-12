@@ -51,12 +51,14 @@ type Proxy struct {
 	httpServer       *http.Server
 	upstream         *http.Transport
 	isListening      atomic.Bool
+	boundAddr        atomic.Value // string; the address actually bound, for :0 listeners
 	baseURL          string // externally-reachable control-plane URL for help links
 	logger           *slog.Logger
 	rateLimit        *ratelimit.Registry // shared with the HTTP server; nil = no-op
 	logSink          requestlog.Sink     // never nil (Nop default); shared with the HTTP server
 	maxResponseBytes int64               // 0 = unlimited
 	maxRequestBytes  int64
+	filter           *filterEngine // nil = policy filtering unavailable
 }
 
 // Options carries the dependencies a Proxy needs. BaseURL is the
@@ -75,6 +77,12 @@ type Options struct {
 	LogSink          requestlog.Sink // nil → Nop
 	MaxResponseBytes int64           // 0 = unlimited (default); >0 = cap in bytes
 	MaxRequestBytes  int64           // 0 → DefaultMaxRequestBytes (1 GiB)
+
+	// Filter enables the per-service policy-filter hop. Nil disables it:
+	// a service carrying a filter block then fails closed rather than
+	// being forwarded unfiltered, because "the policy hop is
+	// unavailable" must never come to mean "skip the policy".
+	Filter *FilterOptions
 }
 
 // New builds a Proxy bound to addr. The returned Proxy does not begin
@@ -111,6 +119,10 @@ func New(addr string, opts Options) *Proxy {
 		logSink:          sink,
 		maxResponseBytes: opts.MaxResponseBytes, // 0 = unlimited
 		maxRequestBytes:  maxReq,
+	}
+
+	if opts.Filter != nil && opts.Filter.Store != nil && opts.Filter.Authority != nil {
+		p.filter = newFilterEngine(*opts.Filter)
 	}
 
 	p.httpServer = &http.Server{
@@ -157,7 +169,22 @@ func (p *Proxy) ListenAndServe() error {
 func (p *Proxy) Serve(l net.Listener) error {
 	p.isListening.Store(true)
 	defer p.isListening.Store(false)
+	// Record what actually got bound: the configured Addr may be ":0",
+	// and the loopback callback advertised to a local sidecar has to name
+	// a port it can reach.
+	if a := l.Addr(); a != nil {
+		p.boundAddr.Store(a.String())
+	}
 	return p.httpServer.Serve(l)
+}
+
+// listenAddr returns the bound address, falling back to the configured
+// one before the listener exists.
+func (p *Proxy) listenAddr() string {
+	if v, ok := p.boundAddr.Load().(string); ok && v != "" {
+		return v
+	}
+	return p.httpServer.Addr
 }
 
 // Shutdown gracefully stops the listener. In-flight CONNECT tunnels are

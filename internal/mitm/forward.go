@@ -15,6 +15,7 @@ import (
 	"github.com/Infisical/agent-vault/internal/brokercore"
 	"github.com/Infisical/agent-vault/internal/ratelimit"
 	"github.com/Infisical/agent-vault/internal/requestlog"
+	"github.com/Infisical/agent-vault/internal/store"
 )
 
 type flushingWriter struct {
@@ -134,14 +135,18 @@ func (p *Proxy) handleForward(w http.ResponseWriter, r *http.Request) {
 		writeProxyAuthChallenge(w, "Proxy-Authorization required")
 		return
 	}
-	scope, err := p.sessions.ResolveForProxy(r.Context(), token, hint)
+	scope, capAuth, err := p.authenticateProxy(r, token, hint)
 	if err != nil {
 		p.recordAuthFailure(r)
 		writeAuthError(w, err)
 		return
 	}
+	capToken := ""
+	if capAuth != nil {
+		capToken = capAuth.rawToken
+	}
 
-	p.forwardRequest(w, r, target, host, portNum, false, scope)
+	p.forwardRequest(w, r, target, host, portNum, false, proxyAuth{scope: scope, capToken: capToken})
 }
 
 // hostHeaderForScheme strips target's port when it matches the default for
@@ -175,9 +180,9 @@ func hostHeaderForScheme(scheme, target string) string {
 // a closed-over target rather than r.Host defeats post-tunnel host
 // rewriting. host is the port-stripped form, already validated in
 // handleConnect; scope is the vault context resolved at CONNECT time.
-func (p *Proxy) forwardHandler(target, host string, port int, scope *brokercore.ProxyScope) http.Handler {
+func (p *Proxy) forwardHandler(target, host string, port int, auth proxyAuth) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		p.forwardRequest(w, r, target, host, port, true, scope)
+		p.forwardRequest(w, r, target, host, port, true, auth)
 	})
 }
 
@@ -192,9 +197,30 @@ func (p *Proxy) forwardRequest(
 	target, host string,
 	port int,
 	useTLSUpstream bool,
-	scope *brokercore.ProxyScope,
+	auth proxyAuth,
 ) {
 	start := time.Now()
+
+	// Re-resolve a capability on every request, including each one inside
+	// an already-established CONNECT tunnel. Thirty seconds is a maximum
+	// lifetime, not a grace period: if the originating session or agent
+	// has been revoked since the tunnel opened, this is where that takes
+	// effect.
+	scope := auth.scope
+	var capAuth *capabilityAuth
+	if auth.capToken != "" {
+		if p.filter == nil {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		var authErr error
+		scope, capAuth, authErr = p.filter.authenticateCapability(r.Context(), auth.capToken)
+		if authErr != nil {
+			writeAuthError(w, authErr)
+			return
+		}
+	}
+
 	authScheme, authHeader := detectAuthFromHeaders(r.Header)
 	event := brokercore.ProxyEvent{
 		Ingress:    brokercore.IngressMITM,
@@ -238,7 +264,73 @@ func (p *Proxy) forwardRequest(
 		return
 	}
 
-	inject, err := p.creds.Inject(r.Context(), scope.VaultID, host, port, r.URL.Path)
+	// Match first, resolve later. Everything between here and
+	// ResolveMatch runs with the destination credential still encrypted,
+	// which is what lets a denied or unreachable filter cost nothing.
+	var match *brokercore.CredentialMatch
+
+	if capAuth != nil && capAuth.kind == store.FilterCapContinuation {
+		// The frozen match is the authority here. Deliberately *not*
+		// re-running the matcher: a service edited during the window must
+		// not be able to retarget which credential slot gets attached.
+		bind := bindFor(r.Method, scheme, target, outURL)
+		rec, cerr := p.filter.opts.Store.ConsumeFilterContinuation(r.Context(), capAuth.rawToken, bind, time.Now())
+		if cerr != nil {
+			// Replay, a mutated URL, expiry, a lost race — all fail closed
+			// with no credential read.
+			p.logger.Debug("filter continuation rejected",
+				slog.String("vault_id", scope.VaultID),
+				slog.String("target_host", target),
+				slog.String("error", cerr.Error()),
+			)
+			http.Error(w, "forbidden", http.StatusForbidden)
+			emit(http.StatusForbidden, "continuation_rejected")
+			return
+		}
+		frozen, terr := brokercore.ThawMatch(rec.MatchSnapshot)
+		if terr != nil {
+			// An unreadable snapshot is a fail-closed condition, not a
+			// reason to fall back to a live match.
+			brokercore.WriteProxyError(w, http.StatusBadGateway, errFilterMisconfigured,
+				"The policy filter's frozen request context could not be read.")
+			emit(http.StatusBadGateway, errFilterMisconfigured)
+			return
+		}
+		match = frozen
+	} else {
+		var merr error
+		match, merr = p.creds.Match(r.Context(), scope.VaultID, host, port, r.URL.Path)
+		if merr != nil {
+			brokercore.WriteInjectError(w, merr, target, scope.VaultName, p.baseURL)
+			emit(http.StatusForbidden, "no_match")
+			return
+		}
+
+		switch {
+		case capAuth != nil && capAuth.kind == store.FilterCapPolicy:
+			// A policy capability may never invoke a filtered service —
+			// not the originating one, and not any other. Recursing would
+			// start a second hop and mint a second set of capabilities.
+			if !policyCapabilityMayUse(match) {
+				http.Error(w, "forbidden", http.StatusForbidden)
+				emit(http.StatusForbidden, "policy_capability_filtered_service")
+				return
+			}
+		case match.HasFilter():
+			if p.filter == nil {
+				// Filtering configured but unavailable must fail closed:
+				// "cannot run the policy" is never "skip the policy".
+				brokercore.WriteProxyError(w, http.StatusBadGateway, errFilterMisconfigured,
+					"This service requires a policy filter, which is not available on this proxy.")
+				emit(http.StatusBadGateway, errFilterMisconfigured)
+				return
+			}
+			p.serveFilterHop(w, r, target, scheme, outURL, scope, match, emit)
+			return
+		}
+	}
+
+	inject, err := p.creds.ResolveMatch(r.Context(), scope.VaultID, match)
 	if inject != nil {
 		event.MatchedService = inject.MatchedName
 		event.MatchedHost = inject.MatchedHost
@@ -330,7 +422,7 @@ func (p *Proxy) forwardRequest(
 		if len(wsSubs) > 0 {
 			outReq.Header.Del("Sec-Websocket-Extensions")
 		}
-		p.forwardWebSocket(w, r, outReq, wsSubs, emit)
+		p.forwardWebSocket(w, r, outReq, wsSubs, emit, nil)
 		return
 	}
 
@@ -353,7 +445,7 @@ func (p *Proxy) forwardRequest(
 	if resp.StatusCode == http.StatusUnauthorized && inject != nil && !inject.Passthrough &&
 		(r.Method == http.MethodGet || r.Method == http.MethodHead) {
 		_ = resp.Body.Close()
-		retryInject, retryErr := p.creds.Inject(r.Context(), scope.VaultID, host, port, r.URL.Path)
+		retryInject, retryErr := p.creds.ResolveMatch(r.Context(), scope.VaultID, match)
 		if retryErr == nil && retryInject != nil && retryInject.Headers != nil {
 			retryReq := outReq.Clone(outReq.Context())
 			for k, v := range retryInject.Headers {
