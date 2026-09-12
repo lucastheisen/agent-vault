@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/Infisical/agent-vault/internal/broker"
 	"github.com/Infisical/agent-vault/internal/catalog"
@@ -30,6 +31,99 @@ func rejectDeprecatedDescription(servicesRaw json.RawMessage) int {
 }
 
 const deprecatedDescriptionMsg = "description is no longer supported; rename via the service name field instead"
+
+// rejectProposedFilter returns the index of the first services entry
+// carrying a `filter` key, or -1. Returns -1 on malformed JSON so the
+// typed decoder produces the structured error downstream.
+//
+// proposal.Service has no Filter field, so such a key would otherwise be
+// dropped silently and the agent would believe it had configured a
+// policy hop. Filters are admin-only; say so instead.
+func rejectProposedFilter(servicesRaw json.RawMessage) int {
+	var probes []map[string]json.RawMessage
+	if err := json.Unmarshal(servicesRaw, &probes); err != nil {
+		return -1
+	}
+	for i, p := range probes {
+		if _, ok := p["filter"]; ok {
+			return i
+		}
+	}
+	return -1
+}
+
+const proposedFilterMsg = "filter is administrator-only and cannot be set or cleared through a proposal"
+
+// filteredDeleteMsg frames a rejected delete of a policy-filtered
+// service for whichever side is reading it.
+func filteredDeleteMsg(names []string) string {
+	return fmt.Sprintf("cannot delete policy-filtered service(s) %s through a proposal — "+
+		"a vault administrator must remove the filter first", strings.Join(names, ", "))
+}
+
+// requireFilterPolicyVaultAdmin enforces the dual-admin rule.
+//
+// Naming a policy_vault other than the service's own vault hands the
+// sidecar 30 seconds of that vault's proxy authority, so the configuring
+// actor has to administer both sides of the delegation. Omitting the
+// field mints no capability at all, and naming the source vault
+// (Layout A) is already covered by the admin check the caller did to get
+// here.
+//
+// Reports false after writing the error response.
+func (s *Server) requireFilterPolicyVaultAdmin(w http.ResponseWriter, r *http.Request, sourceVaultName string, services []broker.Service) bool {
+	ctx := r.Context()
+
+	seen := make(map[string]bool)
+	var targets []string
+	for i := range services {
+		pv := services[i].FilterPolicyVault()
+		if pv == "" || pv == sourceVaultName || seen[pv] {
+			continue
+		}
+		seen[pv] = true
+		targets = append(targets, pv)
+	}
+	if len(targets) == 0 {
+		return true
+	}
+
+	sess := sessionFromContext(ctx)
+	if sess == nil {
+		jsonError(w, http.StatusForbidden, "Authentication required")
+		return false
+	}
+	// A vault-scoped session carries authority over exactly one vault, so
+	// it can never satisfy the far side of the delegation. Say why rather
+	// than returning a bare forbidden.
+	if sess.VaultID != "" {
+		jsonError(w, http.StatusForbidden, fmt.Sprintf(
+			"filter.policy_vault %q names a different vault — configure it from an "+
+				"instance-level session that administers both vaults", targets[0]))
+		return false
+	}
+	actor, err := s.actorFromSession(ctx, sess)
+	if err != nil {
+		jsonError(w, http.StatusForbidden, "Invalid session")
+		return false
+	}
+
+	for _, name := range targets {
+		target, err := s.store.GetVault(ctx, name)
+		if err != nil || target == nil {
+			jsonError(w, http.StatusBadRequest, fmt.Sprintf("filter.policy_vault %q not found", name))
+			return false
+		}
+		role, err := s.store.GetVaultRole(ctx, actor.ID, target.ID)
+		if err != nil || role != "admin" {
+			jsonError(w, http.StatusForbidden, fmt.Sprintf(
+				"filter.policy_vault %q requires vault admin on both %q and %q",
+				name, sourceVaultName, name))
+			return false
+		}
+	}
+	return true
+}
 
 // splitInlineHosts copies the input slice and applies SplitInlineHost
 // to each entry so the matcher invariant (Host has no '/') holds before
@@ -282,8 +376,49 @@ func (s *Server) handleServicesGet(w http.ResponseWriter, r *http.Request) {
 	if services == nil {
 		services = []broker.Service{}
 	}
+	// Filters are an administrator-only concept, invisible to agents
+	// everywhere else (/discover, the skill, proposals). Hold that line
+	// here too: member+ sees the block, so an admin round trip through
+	// `service list` -> `service set` cannot silently drop it, while a
+	// proxy-role caller gets the service without the policy topology.
+	if !s.vaultRoleSatisfies(ctx, ns.ID, "member") {
+		services = withoutFilters(services)
+	}
 
 	jsonOK(w, map[string]interface{}{"vault": name, "services": services})
+}
+
+// vaultRoleSatisfies reports whether the current session meets required
+// in vaultID, without writing a response. For shaping an already
+// authorized read, not for access control.
+func (s *Server) vaultRoleSatisfies(ctx context.Context, vaultID, required string) bool {
+	sess := sessionFromContext(ctx)
+	if sess == nil {
+		return false
+	}
+	if sess.VaultID != "" {
+		return sess.VaultID == vaultID && roleSatisfies(sess.VaultRole, required)
+	}
+	actor, err := s.actorFromSession(ctx, sess)
+	if err != nil {
+		return false
+	}
+	role, err := s.store.GetVaultRole(ctx, actor.ID, vaultID)
+	if err != nil {
+		return false
+	}
+	return roleSatisfies(role, required)
+}
+
+// withoutFilters copies services with every filter block cleared.
+func withoutFilters(in []broker.Service) []broker.Service {
+	out := make([]broker.Service, len(in))
+	copy(out, in)
+	for i := range out {
+		out[i].Filter = nil
+		out[i].FilterExplicit = false
+	}
+	return out
 }
 
 // handleServicesCredentialUsage returns {name, host} for every service
@@ -405,6 +540,12 @@ func (s *Server) handleServicesUpsert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Only the blocks this request is actually submitting are checked;
+	// a preserved filter was authorized when it was first set.
+	if !s.requireFilterPolicyVaultAdmin(w, r, name, incomingSlice) {
+		return
+	}
+
 	// Index existing by canonical Name for upsert.
 	byName := make(map[string]int, len(existing))
 	for i, svc := range existing {
@@ -414,6 +555,13 @@ func (s *Server) handleServicesUpsert(w http.ResponseWriter, r *http.Request) {
 	var upserted []string
 	for _, svc := range incomingSlice {
 		if idx, ok := byName[svc.Name]; ok {
+			// Upsert replaces the whole entry, so an omitted filter would
+			// silently drop an admin's policy hop. A missing key means
+			// preserve; an explicit `filter: null` means clear.
+			if !svc.FilterExplicit {
+				svc.Filter = existing[idx].Filter
+				svc.FilterExplicit = existing[idx].FilterExplicit
+			}
 			existing[idx] = svc
 		} else {
 			byName[svc.Name] = len(existing)
@@ -640,6 +788,12 @@ func (s *Server) handleServicesSet(w http.ResponseWriter, r *http.Request) {
 	cfg := broker.Config{Vault: name, Services: services}
 	if err := broker.Validate(&cfg); err != nil {
 		jsonError(w, http.StatusBadRequest, fmt.Sprintf("Invalid services: %v", err))
+		return
+	}
+
+	// Replace-all: every filter block in the payload is being set now, so
+	// all of them go through the dual-admin gate.
+	if !s.requireFilterPolicyVaultAdmin(w, r, name, services) {
 		return
 	}
 

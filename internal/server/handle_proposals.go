@@ -140,6 +140,10 @@ func (s *Server) handleProposalCreate(w http.ResponseWriter, r *http.Request) {
 			jsonError(w, http.StatusBadRequest, fmt.Sprintf("services[%d]: %s", i, deprecatedDescriptionMsg))
 			return
 		}
+		if i := rejectProposedFilter(probe.Services); i >= 0 {
+			jsonError(w, http.StatusBadRequest, fmt.Sprintf("services[%d]: %s", i, proposedFilterMsg))
+			return
+		}
 	}
 	var req proposalCreateRequest
 	if err := json.Unmarshal(body, &req); err != nil {
@@ -166,6 +170,16 @@ func (s *Server) handleProposalCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.Services = normalized
+
+	// A filtered service cannot be proposed away. Checked here at create
+	// so the agent gets an immediate, actionable 400 rather than a
+	// proposal that sits pending until a human discovers it is
+	// unappliable; re-checked at apply because the vault can change in
+	// between.
+	if names := proposal.FilteredServiceDeletes(existing, req.Services); len(names) > 0 {
+		jsonError(w, http.StatusBadRequest, filteredDeleteMsg(names))
+		return
+	}
 
 	// Validate the proposal.
 	if err := proposal.Validate(req.Services, req.Credentials); err != nil {
@@ -527,6 +541,14 @@ func (s *Server) handleAdminProposalApprove(w http.ResponseWriter, r *http.Reque
 		writeNormalizeError(w, err, http.StatusConflict, http.StatusInternalServerError, func(host string) string {
 			return fmt.Sprintf("proposal targets host %q which no longer matches any service in this vault — reject the proposal manually", host)
 		})
+		return
+	}
+
+	// Re-check against current state: the filter may have been added
+	// after the proposal was raised. A state conflict at apply time is a
+	// 409, matching how normalizeProposalServices reports one.
+	if names := proposal.FilteredServiceDeletes(existingServices, proposedServices); len(names) > 0 {
+		jsonError(w, http.StatusConflict, filteredDeleteMsg(names))
 		return
 	}
 

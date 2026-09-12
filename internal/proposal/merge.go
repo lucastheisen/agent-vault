@@ -59,6 +59,12 @@ func MergeServices(existing []broker.Service, proposed []Service) ([]broker.Serv
 				if len(p.Substitutions) == 0 {
 					next.Substitutions = merged[idx].Substitutions
 				}
+				// Filters are admin-only and never travel in a proposal,
+				// so a full replacement has to carry the stored block
+				// over. Without this an agent could strip a policy hop
+				// just by re-proposing the service's own auth.
+				next.Filter = merged[idx].Filter
+				next.FilterExplicit = merged[idx].FilterExplicit
 				merged[idx] = next
 			default:
 				nameIndex[p.Name] = len(merged)
@@ -97,4 +103,34 @@ func toBrokerService(p Service) broker.Service {
 		copy(svc.Substitutions, p.Substitutions)
 	}
 	return svc
+}
+
+// FilteredServiceDeletes returns the names of policy-filtered services
+// that proposed would delete, in proposal order and deduplicated.
+//
+// Proposals may not delete a filtered service. Preserving the filter
+// block across updates buys nothing if the whole service can be removed
+// instead: the request would fall through to the vault's unmatched-host
+// policy and the policy hop would go with it. Callers reject on a
+// non-empty result rather than merging.
+func FilteredServiceDeletes(existing []broker.Service, proposed []Service) []string {
+	filtered := make(map[string]bool, len(existing))
+	for i := range existing {
+		if existing[i].HasFilter() {
+			filtered[existing[i].Name] = true
+		}
+	}
+	if len(filtered) == 0 {
+		return nil
+	}
+	var hits []string
+	seen := make(map[string]bool, len(proposed))
+	for _, p := range proposed {
+		if p.Action != ActionDelete || !filtered[p.Name] || seen[p.Name] {
+			continue
+		}
+		seen[p.Name] = true
+		hits = append(hits, p.Name)
+	}
+	return hits
 }
