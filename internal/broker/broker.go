@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+
+	"gopkg.in/yaml.v3"
 )
 
 // Config represents a vault's broker configuration as stored in YAML files.
@@ -35,6 +37,17 @@ type Service struct {
 	Enabled       *bool          `yaml:"enabled,omitempty" json:"enabled,omitempty"`
 	Auth          Auth           `yaml:"auth" json:"auth"`
 	Substitutions []Substitution `yaml:"substitutions,omitempty" json:"substitutions,omitempty"`
+
+	// Filter is the optional admin-only policy hop. Nil means the
+	// service takes the ordinary decrypt-and-forward Inject path.
+	Filter *Filter `yaml:"filter,omitempty" json:"filter,omitempty"`
+
+	// FilterExplicit records whether the decoded document carried a
+	// `filter` key at all. Omitting it and writing `filter: null` both
+	// leave Filter nil, but they mean opposite things on upsert —
+	// preserve the stored block vs. clear it — so the distinction has
+	// to survive the YAML -> JSON -> API hop. Never serialized.
+	FilterExplicit bool `yaml:"-" json:"-"`
 }
 
 // MatcherPattern returns the joined inline form (`slack.com/api/*`),
@@ -56,7 +69,68 @@ func (s Service) MarshalJSON() ([]byte, error) {
 	a.Host = s.MatcherPattern()
 	a.Path = ""
 	a.Port = nil
-	return json.Marshal(a)
+	b, err := json.Marshal(a)
+	if err != nil || s.Filter != nil || !s.FilterExplicit {
+		return b, err
+	}
+	// An explicit `filter: null` means "clear the stored block", but
+	// omitempty drops a nil pointer, and upsert reads a missing key as
+	// "omitted — preserve". Re-add the null so a deliberate clear is
+	// still distinguishable on the wire.
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(b, &m); err != nil {
+		return nil, err
+	}
+	m["filter"] = json.RawMessage("null")
+	return json.Marshal(m)
+}
+
+// UnmarshalJSON decodes a service and records whether the payload
+// carried a `filter` key, so upsert can tell "omitted" from an explicit
+// null. See Service.FilterExplicit.
+func (s *Service) UnmarshalJSON(b []byte) error {
+	type alias Service // strip UnmarshalJSON to avoid recursion
+	var a alias
+	if err := json.Unmarshal(b, &a); err != nil {
+		return err
+	}
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(b, &probe); err != nil {
+		return err
+	}
+	*s = Service(a)
+	_, s.FilterExplicit = probe["filter"]
+	return nil
+}
+
+// UnmarshalYAML decodes a service from YAML, recording `filter` key
+// presence the same way UnmarshalJSON does so `filter: null` in an
+// operator's services.yaml survives the trip to the API as a clear
+// rather than collapsing into a no-op preserve.
+func (s *Service) UnmarshalYAML(node *yaml.Node) error {
+	type alias Service // strip UnmarshalYAML to avoid recursion
+	var a alias
+	if err := node.Decode(&a); err != nil {
+		return err
+	}
+	*s = Service(a)
+	s.FilterExplicit = yamlMappingHasKey(node, "filter")
+	return nil
+}
+
+// yamlMappingHasKey reports whether a YAML mapping node has key at the
+// top level. Mapping nodes store keys and values as alternating entries
+// in Content.
+func yamlMappingHasKey(node *yaml.Node, key string) bool {
+	if node == nil || node.Kind != yaml.MappingNode {
+		return false
+	}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		if node.Content[i].Value == key {
+			return true
+		}
+	}
+	return false
 }
 
 // Substitution declares a placeholder string the broker rewrites with a
@@ -377,6 +451,9 @@ func Validate(cfg *Config) error {
 			return fmt.Errorf("service %d: %w", i, err)
 		}
 		if err := s.ValidateSubstitutions(); err != nil {
+			return fmt.Errorf("service %d: %w", i, err)
+		}
+		if err := s.Filter.Validate(); err != nil {
 			return fmt.Errorf("service %d: %w", i, err)
 		}
 	}
