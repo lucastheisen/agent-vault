@@ -22,8 +22,8 @@ Rows 5 and 6 are the continuation.
 | --- | --- | --- |
 | 1 | No service matches | Honor the vault's `unmatched_host_policy`. Same for an agent token or a policy token. |
 | 2 | Match, no `filter` | Inject the destination credential and forward. Same for an agent token or a policy token. |
-| 3 | Match, `filter` set, `policy_vault` omitted | Do not Resolve. Mint a continuation. Reverse-proxy the live request to `filter.url` with that continuation, the callback proxy URL, and the CA. No policy token. Do not forward the inbound agent token. |
-| 4 | Match, `filter` set, `policy_vault` set | Do not Resolve. Mint a continuation. Mint a policy token for the vault that field names. Reverse-proxy the live request with both tokens, the callback proxy URL, and the CA. Do not forward the inbound agent token. Same-vault vs split-vault is only which name is written. |
+| 3 | Match, `filter` set, `policy_vault` omitted | Do not Resolve. Mint a continuation. Reverse-proxy the live request to `filter.url` with that continuation, the callback proxy URL, and the CA. No policy token. |
+| 4 | Match, `filter` set, `policy_vault` set | Do not Resolve. Mint a continuation. Mint a policy token for the vault that field names. Reverse-proxy the live request with both tokens, the callback proxy URL, and the CA. Same-vault vs split-vault is only which name is written. |
 | 5 | Continuation, bind still holds | Skip the sidecar. Resolve the frozen match. Inject onto this inbound request. Forward. Do not run Match again. Do not replay a stored request. |
 | 6 | Continuation, bind does not hold | Do not rewrite the URL, inject, or forward. Burn the continuation. Respond 403 (or 400), not 500. |
 
