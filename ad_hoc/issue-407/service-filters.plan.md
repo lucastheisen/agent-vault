@@ -8,6 +8,30 @@ This is a local working spec, not upstream docs.
 Canonical issue: [RFC: per-service MITM request filter](https://github.com/Infisical/agent-vault/issues/407).
 Do not include `ad_hoc/` in the pull request.
 
+## The seam
+
+This is the design.
+Later sections specify tokens, validation, and tests.
+They do not add a second access-control plane.
+
+Rows 1 and 2 are today's broker.
+Rows 3 and 4 are the hop.
+Rows 5 and 6 are the continuation.
+
+| | When | What happens |
+| --- | --- | --- |
+| 1 | No service matches | Honor the vault's `unmatched_host_policy`. Same for an agent token or a policy token. |
+| 2 | Match, no `filter` | Inject the destination credential and forward. Same for an agent token or a policy token. |
+| 3 | Match, `filter` set, `policy_vault` omitted | Do not Resolve. Mint a continuation. Reverse-proxy the live request to `filter.url` with that continuation, the callback proxy URL, and the CA. No policy token. Do not forward the inbound agent token. |
+| 4 | Match, `filter` set, `policy_vault` set | Do not Resolve. Mint a continuation. Mint a policy token for the vault that field names. Reverse-proxy the live request with both tokens, the callback proxy URL, and the CA. Do not forward the inbound agent token. Same-vault vs split-vault is only which name is written. |
+| 5 | Continuation, bind still holds | Skip the sidecar. Resolve the frozen match. Inject onto this inbound request. Forward. Do not run Match again. Do not replay a stored request. |
+| 6 | Continuation, bind does not hold | Do not rewrite the URL, inject, or forward. Burn the continuation. Respond 403 (or 400), not 500. |
+
+A disabled service is today's deny.
+That is not a hop.
+
+The bind in rows 5 and 6 is method, scheme, authority, escaped path, and raw query.
+
 ## Problem
 
 Today a service is: this host, path, and port get this credential.
@@ -56,24 +80,27 @@ The sidecar sees `git-receive-pack`, checks whether the branch is protected, and
 
 ## 1. Placement in the pipeline
 
+The request path is [The seam](#the-seam).
+This section only states when the destination secret is opened.
+
 Today every proxied request does this:
 
 authenticate -> rate limit -> Inject (match the service and decrypt the dest secret) -> maybe substitutions -> origin (or a WebSocket).
 
-Unfiltered services stay on that path.
+Unfiltered services stay on that path (seam row 2).
 No sidecar, no capability row.
 If the filter machinery is down, ordinary proxying must still work.
 
-Filtered services split Inject in two:
+Filtered services split Inject in two (seam rows 3 and 4):
 
 authenticate -> rate limit -> Match (which service? no decrypt) -> hop the live request to `filter.url` -> whatever the sidecar returns is what the client sees.
 
-Decrypt (Resolve) happens only later, if the sidecar continues with a hop token, or immediately on the unfiltered path as today.
+Decrypt (Resolve) happens only later, if the continuation bind holds (seam row 5), or immediately on the unfiltered path as today.
 
 If the sidecar says no, times out, or cannot be reached, Agent Vault must not have opened the dest secret at all.
 A 403 that still decrypted the PAT in the background is a failed design.
 
-A disabled service or no match is unchanged.
+A disabled service or no match is unchanged (seam rows 1 and today's deny).
 Do not call the sidecar.
 
 Fail-closed errors, required Match/Resolve interfaces, and how tests prove the no-decrypt invariant are specified in sections 6 and 11.
@@ -104,7 +131,7 @@ services:
 | `ca` | no | PEM certificate(s) used as the only TLS roots for this hop. Omit it when `https` uses a public CA. Pin it when the sidecar is a compose or other private name with a self-signed cert. |
 
 The named policy vault is an ordinary vault.
-Agent Vault does not constrain which unfiltered services live there.
+Agent Vault does not constrain which services live there.
 
 Clear the block with `filter: null` on `vault service add`.
 Who may set or clear it, and how YAML `null` survives JSON, is specified in section 3.
@@ -149,26 +176,27 @@ There are three modes.
 Worked YAML is in section 9.
 
 **Omitted.**
-No policy capability is minted.
+No policy token is minted (seam row 3).
 The sidecar can decide from the body and headers on this hop.
-It cannot call other vault services through Agent Vault.
+It is not given extra vault access.
 
 **Same-vault layout.**
 `policy_vault` is set to the source vault's name.
 That name must be written explicitly.
 Omitting the field is not the same-vault layout.
-The sidecar gets a 30-second policy capability on the source vault, so it can call other unfiltered services there.
+The sidecar gets a 30-second policy token on the source vault (seam row 4).
+That token uses the same seam as the agent: unmatched policy, unfiltered inject, filtered hop.
 
 **Split-vault layout.**
 `policy_vault` names a different vault.
-The sidecar gets a 30-second policy capability on that vault.
+The sidecar gets a 30-second policy token on that vault (seam row 4).
 The configuring actor must be vault admin of both vaults.
 Dual-admin is required only for the split-vault layout.
 
-In both layouts that mint a policy capability, that token cannot invoke any filtered service, including the originating one.
-Put the protection API (and any other side channel) on an unfiltered service in the chosen vault.
+Same-vault vs split-vault is only which vault the minted policy token names.
+Hop handling is the same.
 
-| Mode | `policy_vault` | Policy capability |
+| Mode | `policy_vault` | Policy token |
 | --- | --- | --- |
 | Omitted | absent | none |
 | Same-vault | source vault name | 30s on the source vault |
@@ -330,7 +358,7 @@ It sends `Proxy-Authorization` set to the continuation token against `X-Agent-Va
 Agent Vault verifies, consumes, skips this service's filter, resolves the frozen match, injects those destination credentials, and forwards whatever body the sidecar sent.
 
 A continuation cannot retarget the host.
-Retargeting (GitLab to GitHub) is the policy capability's job, against a different unfiltered service.
+Retargeting (GitLab to GitHub) is a new request with the policy token (seam rows 1 through 4).
 
 Both admission claim and exact-request consume must occur before `expires_at`.
 Claiming at second 29 does not pin an unused continuation past expiry.
@@ -375,35 +403,25 @@ Retain the name only for display and audit.
 Vault deletion invalidates the row.
 A rename does not retarget it.
 
-Used for side-channel calls and for self-completing on a different unfiltered service.
+Used for side-channel calls and for a new request to a different service.
+That new request follows [The seam](#the-seam) in the named vault, including a filtered hop.
 
 It cannot:
 
 - spend the originating continuation's destination credential
-- invoke any filtered service, originating or otherwise
 - outlive 30s
 - be used after the invocation is retired
 
-A policy capability never reads or honors `unmatched_host_policy`.
-That setting defaults to `passthrough`.
-Without this rule, a stolen policy token is a 30-second open forward proxy attributed to the initiating actor.
+A policy token is a short lease of the initiating actor on the named vault.
+It honors that vault's `unmatched_host_policy`.
+It is not a second access-control plane.
 
-- no configured match -> fail closed
-- disabled match -> fail closed
-- filtered match -> fail closed (no recursion, no second capability mint)
-- unfiltered configured match, including an explicitly configured passthrough service -> proceed normally
+Policy CONNECT uses the same pre-hijack rules as an agent session in that vault.
+Continuation CONNECT still binds authority before hijack (section 5.2).
 
-Do not implement this as "call ordinary Match and reject a `Passthrough` result" if ordinary Match has already consulted the vault setting.
-Keep the strict mode separable enough that a test can assert the setting store was never read.
-
-Policy CONNECT is gated pre-hijack.
-The target host and port must be covered by at least one enabled, unfiltered configured service in the policy vault.
-Path is checked by strict matching on each inner request.
-Without this gate, the policy token is the same tunnel-admission and leaf-minting oracle as an unbound continuation.
-
-Same-vault residual: a stolen policy capability can still reach other unfiltered services in the source vault until the hop ends or 30 seconds, whichever is first.
+Same-vault residual: a holder of the policy token can use that vault the way the agent can, until the hop ends or 30 seconds, whichever is first.
 Document it.
-The split-vault layout removes it.
+The split-vault layout shrinks which vault that is.
 
 On every inner request of a policy CONNECT tunnel, revalidate source authority.
 Observing a revoked or expired source burns that policy capability.
@@ -531,7 +549,7 @@ Logging follows the same distinction:
 
 ## 6. Enforcement is mandatory
 
-Match, frozen-match resolution, capability claim, consume, and validate, source-authority revalidation, strict policy matching, and policy-vault lookup are required interface members.
+Match, frozen-match resolution, capability claim, consume, and validate, source-authority revalidation, and policy-vault lookup are required interface members.
 Never guard them with an optional type assertion that means "skip the check when absent".
 Test doubles must implement the same security surface as production stores.
 
@@ -544,11 +562,11 @@ A service configured with a filter, on a proxy with no filter engine or no share
 
 ## 7. Skip or deny on the way back
 
-- Continuation (valid, exact bind, frozen match): skip this service's filter, Resolve the frozen match, forward.
-- Policy capability matching any filtered service: fail closed.
-  Do not recurse.
-  Do not inject.
-- Anything else on a filtered service: hop to the sidecar as usual.
+This is [The seam](#the-seam) rows 3 through 6.
+
+- Continuation, bind holds: skip this service's filter, Resolve the frozen match, inject onto this request, forward.
+- Continuation, bind does not hold: burn, 403 (or 400), no inject, no forward.
+- Filtered match, not a holding continuation: hop (agent session or policy token).
 
 ## 8. The reverse-proxy hop
 
@@ -710,9 +728,9 @@ Cleartext `url: http://filter:12345` with `allow_insecure_private_http: true` re
 | sidecar, policy cap | `GET https://api.github.com/repos/.../protection` | Unfiltered, inject `GITHUB_TOKEN`. |
 | sidecar, allowed | new receive-pack via continuation | Claim and consume, Resolve frozen match, inject, GitHub. |
 | sidecar, protected | 403 (or any status) on the client hop | No dest decrypt, no origin, leftover caps retired. |
-| stolen policy cap -> `git-receive-pack` | filtered service | Fail closed. |
-| stolen policy cap -> unmatched public host | vault passthrough default | Fail closed. Strict match, setting never read. |
-| stolen policy cap -> other unfiltered write service in `dev` | residual until hop end or 30s | Document. Prefer the split-vault layout if that residual is unacceptable. |
+| stolen policy cap -> `git-receive-pack` | filtered service | Hop (seam row 3 or 4). Sidecar may still deny. |
+| stolen policy cap -> unmatched public host | vault unmatched policy | Same as the agent (seam row 1). |
+| stolen policy cap -> other service in `dev` | residual until hop end or 30s | Same seam as the agent. Prefer the split-vault layout if that residual is unacceptable. |
 
 ### 9.2 Split-vault layout
 
@@ -721,7 +739,8 @@ The configuring admin must be admin of both vaults.
 A stolen policy capability cannot attach the write PAT.
 Allowed push is still continuation to the frozen `dev` match.
 
-Retargeting (GitLab to GitHub) uses the policy capability against an unfiltered GitHub write service in `policy_vault`.
+Retargeting (GitLab to GitHub) uses the policy token against a GitHub write service in `policy_vault`.
+If that service is filtered, that is another hop.
 
 ```yaml
 # dev-services.yaml
@@ -755,7 +774,7 @@ services:
 
 - `broker.Service`: `Filter {url, policy_vault, allow_insecure_private_http, ca}`, validation per section 2.2, no `agent_id`, a presence tri-state so `filter: null` survives the CLI -> API hop.
 - `proposal`: preserve `filter`, reject an explicit `filter` key, reject delete of a filtered service, reject shadowing matchers at create and apply (section 4).
-- `brokercore`: Match vs Resolve as required interface members, frozen match freeze and thaw with a version envelope, no dest decrypt on the filter path, `av_cont_` / `av_pol_`, strict policy Match that never reads unmatched-host policy.
+- `brokercore`: Match vs Resolve as required interface members, frozen match freeze and thaw with a version envelope, no dest decrypt on the filter path, `av_cont_` / `av_pol_`, policy token follows [The seam](#the-seam) in the named vault.
 - `store`: capability table with constraints on kind and state, indexes on token hash, expiry, source-session hash, and invocation id, the three-state FSM, transactional pair minting, invocation correlation and retirement, scheduled sweep following the existing ticker-until-context-cancel pattern.
 - `mitm`: reverse-proxy to `filter.url`, admission-time claim on both ingress shapes, token vs proxy-URL headers, strip-then-set both directions, dedicated per-service dialer, filtered WS reverse-proxy plus continuation bridge, capability tokens accepted on the data plane only.
 - `server` / `cmd`: dual-admin when `policy_vault` differs, omitted `policy_vault` mints nothing, `AGENT_VAULT_FILTER_PROXY_URL` validated fatally at startup.
@@ -777,11 +796,12 @@ Do not let it read as tested.
    When introduced between create and apply, apply is 409 with no mutation.
    Include disjoint host, path, and port cases proving the overlap helper does not reject harmless services.
    Admin YAML writing the same exception is allowed.
-2. Policy capability plus unmatched host plus vault `unmatched_host_policy=passthrough` is denied.
-   Origin is never contacted.
-   The unmatched-policy store method was never called.
-3. Policy CONNECT to an authority with no eligible unfiltered configured service is rejected before hijack and leaf mint.
-   A path mismatch after an otherwise eligible CONNECT also fails closed.
+2. Policy token plus unmatched host honors the vault's `unmatched_host_policy`, same as an agent session (seam row 1).
+   Passthrough forwards with no inject.
+   Deny does not contact origin.
+3. Policy CONNECT uses the same pre-hijack rules as an agent session in that vault.
+   Continuation CONNECT to the wrong authority still burns before hijack and leaf mint (section 5.2).
+   A continuation path mismatch after an otherwise eligible CONNECT also fails closed.
 
 ### Capability lifecycle and revocation
 
@@ -845,7 +865,7 @@ Do not let it read as tested.
 - Widening revocation to ordinary established unfiltered CONNECT tunnels.
 - Rewriting the frozen projection as raw `broker.Service` JSON, or including `Filter` in it.
 - A TTL flag or env override.
-- RFC 9457, filter-agents, in-process plugins, or nested filter hops.
+- RFC 9457, filter-agents, or in-process plugins.
 - Hiding filtered services from `/discover`.
   Hiding the filter block and capability material is the requirement.
 - Changing the Match/Resolve split, adding filter-agents, treating omitted `policy_vault` as an implicit same-vault capability, or dropping the same-vault layout.
@@ -873,11 +893,10 @@ Do not let it read as tested.
 6. `policy_vault` omitted means no policy capability.
    Source vault name is the same-vault layout, written explicitly.
    Another vault is the split-vault layout plus dual-admin.
-7. A policy capability cannot spend the originating destination credential and cannot invoke any filtered service.
+7. A policy token cannot spend the originating continuation's destination credential.
+   It follows [The seam](#the-seam) in the named vault: unmatched policy, unfiltered inject, filtered hop.
    Capabilities are data-plane-only, proxy-role authority.
    Audit as the initiator.
-   Strict configured-service-only match.
-   Never read `unmatched_host_policy`.
 8. Fail closed on hop, capability, Match, snapshot, or missing-engine failure.
    502/504 with the existing JSON envelope.
    A configured filter that cannot be run is never a bypass.
@@ -914,8 +933,8 @@ Do not let it read as tested.
 19. Proposals may not introduce a matcher that wins or ties an existing filtered service, checked at create and apply with exact matcher-language overlap (section 4).
     Proposal-only.
     Admin YAML may author exceptions.
-20. Policy capabilities match configured, enabled, unfiltered services only and never consult `unmatched_host_policy`.
-    CONNECT has a pre-hijack authority eligibility gate (section 5.3).
+20. A policy token is a short lease of the initiating actor on the named vault and follows [The seam](#the-seam).
+    Policy CONNECT uses the same pre-hijack rules as an agent session in that vault (section 5.3).
 21. Continuations are claimed at admission against the bound authority, before hijack.
     Consume requires state `claimed`.
     Mismatches burn the row.
