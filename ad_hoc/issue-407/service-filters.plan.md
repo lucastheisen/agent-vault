@@ -23,7 +23,7 @@ Rows 5 and 6 are the continuation.
 | 1 | No service matches | Honor the vault's `unmatched_host_policy`. Same for an agent token or a policy token. |
 | 2 | Match, no `filter` | Inject the destination credential and forward. Same for an agent token or a policy token. |
 | 3 | Match, `filter` set, `policy_vault` omitted | Do not Resolve. Mint a continuation. Reverse-proxy the live request to `filter.url` with that continuation, the callback proxy URL, and the CA. No policy token. |
-| 4 | Match, `filter` set, `policy_vault` set | Do not Resolve. Mint a continuation. Mint a policy token for the vault that field names. Reverse-proxy the live request with both tokens, the callback proxy URL, and the CA. Same-vault vs split-vault is only which name is written. |
+| 4 | Match, `filter` set, `policy_vault` set | Do not Resolve. Mint a continuation. Mint a policy token for the vault that field names. Reverse-proxy the live request with both tokens, the callback proxy URL, and the CA. |
 | 5 | Continuation, bind still holds | Skip the sidecar. Resolve the frozen match. Inject onto this inbound request. Forward. Do not run Match again. Do not replay a stored request. |
 | 6 | Continuation, bind does not hold | Do not rewrite the URL, inject, or forward. Burn the continuation. Respond 403 (or 400), not 500. |
 
@@ -126,7 +126,7 @@ services:
 | Field | Required | Meaning |
 | --- | --- | --- |
 | `url` | yes if `filter` present | Sidecar origin. `https` normally. Literal-loopback `http` is allowed without a flag. Non-loopback `http` requires `allow_insecure_private_http: true`. |
-| `policy_vault` | no | Vault the policy capability is scoped to. Omitted, same-vault, and split-vault layouts are defined in section 2.1. |
+| `policy_vault` | no | Vault the policy token is scoped to. Omitted means none. Why you would name the source vault or another vault is explained in section 2.1. |
 | `allow_insecure_private_http` | no | Opt-in for cleartext HTTP to a private sidecar that is not a literal loopback IP. Literal loopback HTTP does not need it. Weaker than TLS. Document it as such. |
 | `ca` | no | PEM certificate(s) used as the only TLS roots for this hop. Omit it when `https` uses a public CA. Pin it when the sidecar is a compose or other private name with a self-signed cert. |
 
@@ -169,38 +169,23 @@ services:
 
 Cleartext HTTP on that network remains available with `allow_insecure_private_http: true` and no `ca`.
 
-### 2.1 `policy_vault` modes
+### 2.1 Choosing `policy_vault`
 
-This field chooses whether the sidecar gets a policy capability, and which vault that capability can use.
-There are three modes.
+Omit it for a body-or-headers hop (seam row 3).
+Set it to mint a 30-second policy token for that vault (seam row 4).
+The hop does not change based on which name you write.
+The choice is what that token can reach.
 Worked YAML is in section 9.
 
-**Omitted.**
-No policy token is minted (seam row 3).
-The sidecar can decide from the body and headers on this hop.
-It is not given extra vault access.
+**Name the source vault** when the sidecar should call other services in the same vault (the GitHub protection API next to the push row).
+Write the name explicitly.
+Omit is not this.
 
-**Same-vault layout.**
-`policy_vault` is set to the source vault's name.
-That name must be written explicitly.
-Omitting the field is not the same-vault layout.
-The sidecar gets a 30-second policy token on the source vault (seam row 4).
-That token uses the same seam as the agent: unmatched policy, unfiltered inject, filtered hop.
+**Name a different vault** when you want that extra access on a smaller vault (read API only).
+The person writing the config must be vault admin of both.
 
-**Split-vault layout.**
-`policy_vault` names a different vault.
-The sidecar gets a 30-second policy token on that vault (seam row 4).
-The configuring actor must be vault admin of both vaults.
-Dual-admin is required only for the split-vault layout.
-
-Same-vault vs split-vault is only which vault the minted policy token names.
-Hop handling is the same.
-
-| Mode | `policy_vault` | Policy token |
-| --- | --- | --- |
-| Omitted | absent | none |
-| Same-vault | source vault name | 30s on the source vault |
-| Split-vault | different vault name | 30s on that vault; dual-admin |
+A holder of the policy token can use the named vault the way the agent can, until the hop ends or 30 seconds.
+Pick the smaller vault if that residual is too wide.
 
 ### 2.2 `filter.url` validation
 
@@ -419,9 +404,9 @@ It is not a second access-control plane.
 Policy CONNECT uses the same pre-hijack rules as an agent session in that vault.
 Continuation CONNECT still binds authority before hijack (section 5.2).
 
-Same-vault residual: a holder of the policy token can use that vault the way the agent can, until the hop ends or 30 seconds, whichever is first.
-Document it.
-The split-vault layout shrinks which vault that is.
+A holder of the policy token can use the named vault the way the agent can, until the hop ends or 30 seconds, whichever is first.
+Naming a smaller vault shrinks that.
+See section 2.1.
 
 On every inner request of a policy CONNECT tunnel, revalidate source authority.
 Observing a revoked or expired source burns that policy capability.
@@ -868,7 +853,7 @@ Do not let it read as tested.
 - RFC 9457, filter-agents, or in-process plugins.
 - Hiding filtered services from `/discover`.
   Hiding the filter block and capability material is the requirement.
-- Changing the Match/Resolve split, adding filter-agents, treating omitted `policy_vault` as an implicit same-vault capability, or dropping the same-vault layout.
+- Changing the Match/Resolve split, adding filter-agents, or treating omitted `policy_vault` as a token on the source vault.
 - A named `ca.<name>` catalog.
   YAML anchors are the DRY mechanism. Each stored service keeps its own PEM.
 
@@ -890,9 +875,9 @@ Do not let it read as tested.
    FSM is `issued -> claimed -> consumed`.
    Mismatch burns the row.
    A second admission fails.
-6. `policy_vault` omitted means no policy capability.
-   Source vault name is the same-vault layout, written explicitly.
-   Another vault is the split-vault layout plus dual-admin.
+6. `policy_vault` omitted means no policy token.
+   Set means a 30s token for that vault.
+   Naming a vault other than the source requires admin of both.
 7. A policy token cannot spend the originating continuation's destination credential.
    It follows [The seam](#the-seam) in the named vault: unmatched policy, unfiltered inject, filtered hop.
    Capabilities are data-plane-only, proxy-role authority.
