@@ -18,19 +18,31 @@ Rows 1 and 2 are today's broker.
 Rows 3 and 4 are the hop.
 Rows 5 and 6 are the continuation.
 
+A continuation is minted on the hop (rows 3 and 4).
+It records two things.
+Neither is the destination secret or the request body.
+
+**Bind.** The identity of the request the sidecar saw: method, scheme, authority, escaped path, and raw query.
+Rows 5 and 6 compare the inbound request to that bind, byte for byte.
+The sidecar may send a new body.
+It may not change the URL.
+A changed path is row 6, not a rewrite to the old path.
+
+**Frozen match.** Which service won, and the non-secret inject shape (auth type, key names, substitutions).
+Row 5 uses that to Resolve.
+It does not run Match again.
+
 | | When | What happens |
 | --- | --- | --- |
 | 1 | No service matches | Honor the vault's `unmatched_host_policy`. Same for an agent token or a policy token. |
 | 2 | Match, no `filter` | Inject the destination credential and forward. Same for an agent token or a policy token. |
 | 3 | Match, `filter` set, `policy_vault` omitted | Do not Resolve. Mint a continuation. Reverse-proxy the live request to `filter.url` with that continuation, the callback proxy URL, and the CA. No policy token. |
 | 4 | Match, `filter` set, `policy_vault` set | Do not Resolve. Mint a continuation. Mint a policy token for the vault that field names. Reverse-proxy the live request with both tokens, the callback proxy URL, and the CA. |
-| 5 | Continuation, bind still holds | Skip the sidecar. Resolve the frozen match. Inject onto this inbound request. Forward. Do not run Match again. Do not replay a stored request. |
+| 5 | Continuation, bind still holds | Skip the sidecar. Resolve the frozen match. Inject onto this inbound request. Forward. |
 | 6 | Continuation, bind does not hold | Do not rewrite the URL, inject, or forward. Burn the continuation. Respond 403 (or 400), not 500. |
 
 A disabled service is today's deny.
 That is not a hop.
-
-The bind in rows 5 and 6 is method, scheme, authority, escaped path, and raw query.
 
 ## Problem
 
