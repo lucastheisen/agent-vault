@@ -71,23 +71,23 @@ The sidecar sees `git-receive-pack`, checks whether the branch is protected, and
 - In-process plugins, WASM, Go `.so`, or a new rules language.
 - A second client-facing proxy.
   Clients keep talking to Agent Vault.
-  How the vault calls the sidecar, and whether the sidecar calls back, is specified in sections 5 and 8.
+  How the vault calls the sidecar, and whether the sidecar calls back, is specified in [section 4](#4-the-two-capabilities) and [section 7](#7-the-reverse-proxy-hop).
 - The sidecar is not an Agent Vault agent and does not get a long-lived token.
-  How it may call back is specified in section 5.
+  How it may call back is specified in [section 4](#4-the-two-capabilities).
 - RFC 9457 Problem Details.
   A nicer error shape, but not how Agent Vault reports proxy errors today.
   This change does not adopt it.
-  The existing envelope is specified in section 8.
+  The existing envelope is specified in [section 7](#7-the-reverse-proxy-hop).
 - A dashboard, `--filter-*` flags, or a `vault service filter` subcommand.
   Admin YAML is enough for v1.
 - Changing global matcher semantics.
   Which service wins a request stays as it is today.
-  How proposals may not shadow a filtered service is specified in section 4.
+  How proposals may not shadow a filtered service is specified in [section 3.1](#31-proposals-cannot-shadow-a-filtered-matcher).
 - Changing how ordinary unfiltered CONNECT tunnels are revoked.
   `agent revoke` still takes effect on the next CONNECT, not an already-open one.
-  Filter capabilities are stricter. That is specified in section 5.
+  Filter capabilities are stricter. That is specified in [section 4](#4-the-two-capabilities).
 - A TTL flag or env override.
-  Hop tokens last 30 seconds, specified in section 5.
+  Hop tokens last 30 seconds, specified in [section 4](#4-the-two-capabilities).
   Making that configurable is out of this change.
 
 ## 1. Placement in the pipeline
@@ -115,7 +115,7 @@ A 403 that still decrypted the PAT in the background is a failed design.
 A disabled service or no match is unchanged (seam rows 1 and today's deny).
 Do not call the sidecar.
 
-Fail-closed errors, required Match/Resolve interfaces, and how tests prove the no-decrypt invariant are specified in sections 6 and 11.
+Fail-closed errors, required Match/Resolve interfaces, and how tests prove the no-decrypt invariant are specified in [section 5](#5-enforcement-is-mandatory) and [section 10](#10-tests).
 
 ## 2. Config
 
@@ -138,7 +138,7 @@ services:
 | Field | Required | Meaning |
 | --- | --- | --- |
 | `url` | yes if `filter` present | Sidecar origin. `https` normally. Literal-loopback `http` is allowed without a flag. Non-loopback `http` requires `allow_insecure_private_http: true`. |
-| `policy_vault` | no | Vault the policy token is scoped to. Omitted means none. Why you would name the source vault or another vault is explained in section 2.1. |
+| `policy_vault` | no | Vault the policy token is scoped to. Omitted means none. Why you would name the source vault or another vault is explained in [section 2.1](#21-choosing-policy_vault). |
 | `allow_insecure_private_http` | no | Opt-in for cleartext HTTP to a private sidecar that is not a literal loopback IP. Literal loopback HTTP does not need it. Weaker than TLS. Document it as such. |
 | `ca` | no | PEM certificate(s) used as the only TLS roots for this hop. Omit it when `https` uses a public CA. Pin it when the sidecar is a compose or other private name with a self-signed cert. |
 
@@ -146,7 +146,7 @@ The named policy vault is an ordinary vault.
 Agent Vault does not constrain which services live there.
 
 Clear the block with `filter: null` on `vault service add`.
-Who may set or clear it, and how YAML `null` survives JSON, is specified in section 3.
+Who may set or clear it, and how YAML `null` survives JSON, is specified in [section 3](#3-who-may-change-a-filter).
 
 A Compose sidecar on the same Docker network is not loopback.
 Prefer HTTPS and pin the sidecar CA.
@@ -187,7 +187,7 @@ Omit it for a body-or-headers hop (seam row 3).
 Set it to mint a 30-second policy token for that vault (seam row 4).
 The hop does not change based on which name you write.
 The choice is what that token can reach.
-Worked YAML is in section 9.
+Worked YAML is in [section 8](#8-layouts).
 
 **Name the source vault** when the sidecar should call other services in the same vault (the GitHub protection API next to the push row).
 Write the name explicitly.
@@ -199,7 +199,7 @@ The person writing the config must be vault admin of both.
 A holder of the policy token can use the named vault the way the agent can, until the hop ends or 30 seconds.
 Pick the smaller vault if that residual is too wide.
 
-### 2.2 `filter.url` validation
+### 2.2 `filter.url` and `ca`
 
 The URL must be absolute `http` or `https` and must include a host.
 A path prefix is allowed.
@@ -211,44 +211,51 @@ Reject:
 - a fragment
 - a configured query or `ForceQuery` (the hop replaces the query with the original request query, so leftover query is unused and can hide secrets in config and logs)
 - any scheme other than `http` or `https`
+- non-loopback `http` without `allow_insecure_private_http: true`
 - `ca` on an `http` URL
 - empty, non-PEM, or private-key material in `ca`
 
-When `ca` is set, `url` must be `https`, and the value must parse as at least one `CERTIFICATE` PEM.
+When `ca` is set, the value must parse as at least one `CERTIFICATE` PEM.
 The hop verifies using only those roots, not the system pool.
 The URL hostname must match the certificate.
 There is no `ca_file`, `tls_server_name`, or skip-verify flag.
 
-### 2.3 `AGENT_VAULT_FILTER_PROXY_URL`
+### 2.3 `AGENT_VAULT_MITM_ADDR`
 
-This is the MITM base URL a remote sidecar calls back on.
-Unset means advertise the process's own loopback listener, which only a same-host sidecar can reach.
+This is the MITM analogue of `AGENT_VAULT_ADDR`.
+It does not bind a listener and is not checked against `--host` or `--mitm-port` at startup.
+It is the URL advertised for the proxy door: hop headers, and `vault run`'s `HTTPS_PROXY` when set.
+The hostname is a SAN on MITM leaf certs when clients TLS-verify the proxy's own name (same role `AGENT_VAULT_ADDR` has today).
+It is not filter-specific except that hop headers carry it.
 
-It must be a base URL: no userinfo, path, query, or fragment.
-`https`, except `http` to a literal loopback IP.
+It must be a base URL: scheme `http` (the MITM is a plain HTTP proxy), host, optional port, no userinfo, path, query, or fragment.
+An explicit invalid value is fatal at startup so hops never advertise junk.
+A mismatch with `--host` is not fatal.
+Clients that trust the advertised URL fail to connect, same as a wrong `AGENT_VAULT_ADDR`.
 
-An invalid explicit value is fatal at startup.
-Do not warn and fall back to loopback.
-Do not advertise the raw invalid string.
+Unset: hostname from `AGENT_VAULT_ADDR`, port from the MITM listener, scheme `http`, matching `vault run` today.
+If `AGENT_VAULT_ADDR` is unset, or its host is missing or a wildcard (`0.0.0.0`, `::`), advertise loopback.
+Compose with only `AGENT_VAULT_ADDR=http://agent-vault:14321` still yields `http://agent-vault:14322`.
+Set `AGENT_VAULT_MITM_ADDR` when the proxy must be advertised under a different name than the control plane (public UI vs docker DNS).
 
-Document in [`.env.example`](../../.env.example), [environment variables](../../docs/self-hosting/environment-variables.mdx), and the env table in [CLI reference](../../docs/reference/cli.mdx).
+Document in [`.env.example`](../../.env.example), [environment variables](../../docs/self-hosting/environment-variables.mdx), and the env table in [CLI reference](../../docs/reference/cli.mdx), next to `AGENT_VAULT_ADDR`.
 
-## 3. Who writes what
+## 3. Who may change a filter
 
-| Write | `filter` |
-| --- | --- |
-| Agent proposal that sets or clears `filter` (object or `null`) | Reject 400. |
-| Agent proposal that deletes a filtered service | Reject at create and apply. |
-| Agent proposal whose effective `set` matcher can win over or tie an existing filtered matcher | Reject at create (400) and re-check at apply (409). See section 4. |
-| Agent proposal that updates auth or host of a filtered service and keeps that service's filter | Preserve `filter`. |
-| Agent proposal with `enabled: false` on a filtered service | Allow. |
-| `vault service add` / POST upsert, field omitted | Preserve. |
-| `vault service add` with `filter:` or `filter: null` | Set or clear. |
-| `vault credential set` | Does not touch services. |
-| `vault service set` (replace list) / `clear` | Not preserved. Document this. |
-| Interactive `service set` "Replace all" | Same as `set` (wipe). No wizard prompt for filter in v1. |
-| Admin delete service | Allowed. |
-| Admin YAML or upsert of an overlapping unfiltered exception | Allowed. |
+| Actor | Action | Outcome |
+| --- | --- | --- |
+| Agent | Proposal that sets or clears `filter` (object or `null`) | Reject 400 |
+| Agent | Proposal that deletes a filtered service | Reject at create and apply |
+| Agent | Proposal whose effective `set` matcher can win or tie an existing filtered matcher | Reject 400 at create, 409 at apply ([section 3.1](#31-proposals-cannot-shadow-a-filtered-matcher)) |
+| Agent | Proposal that updates auth or host of a filtered service and keeps that service's filter | Preserve `filter` |
+| Agent | Proposal with `enabled: false` on a filtered service | Allow |
+| Admin | `vault service add` / POST upsert, `filter` omitted | Preserve |
+| Admin | `vault service add` with `filter:` or `filter: null` | Set or clear |
+| Admin | `vault credential set` | Does not touch services |
+| Admin | `vault service set` (replace list) / `clear` | Not preserved. Document this. |
+| Admin | Interactive `service set` "Replace all" | Same as `set` (wipe). No wizard prompt for filter in v1. |
+| Admin | Delete service | Allowed |
+| Admin | YAML or upsert of an overlapping unfiltered exception | Allowed |
 
 An explicit `filter` key in proposal JSON, including `filter: null`, is 400.
 Silently dropping the unknown key is not enough.
@@ -270,7 +277,7 @@ The filter block is operator-only.
 `/discover` and the agent skill omit it.
 Proxy-role callers read services without the filter block, matching `/discover`.
 
-## 4. Proposals cannot shadow a filtered matcher
+### 3.1 Proposals cannot shadow a filtered matcher
 
 `MatchScore.Better` ranks host tier, then port specificity, then path literal length.
 It ignores declaration order.
@@ -304,7 +311,7 @@ A vault admin may still author an overlapping unfiltered exception through YAML 
 Do not change `MatchScore` so that any overlapping filtered matcher always hops.
 That would remove deliberate admin exceptions and change semantics for unfiltered traffic.
 
-## 5. The two capabilities
+## 4. The two capabilities
 
 Do not forward the inbound `Proxy-Authorization` or agent session to the sidecar.
 Do not create an agent row.
@@ -341,7 +348,7 @@ Token prefixes, following `av_sess_` / `av_agt_`:
 Distinct prefixes let ingress dispatch without "try a session, then a capability".
 They also give log redaction a stable match.
 
-### 5.1 Continuation
+### 4.1 Continuation
 
 Per invocation, single use.
 
@@ -362,7 +369,7 @@ Claiming at second 29 does not pin an unused continuation past expiry.
 Once consumed, ordinary origin body, first-header, and WebSocket idle budgets apply.
 The 30-second deadline does not kill the established stream.
 
-### 5.2 Three-state lifecycle
+### 4.2 Three-state lifecycle
 
 `issued -> claimed -> consumed`.
 
@@ -392,7 +399,7 @@ The atomic mechanism on SQLite is `UPDATE ... WHERE state = ?` plus `RowsAffecte
 `SELECT ... FOR UPDATE` is additional PostgreSQL locking, not the basis of SQLite correctness.
 Say so in the store code.
 
-### 5.3 Policy capability
+### 4.3 Policy capability
 
 Exists only when `policy_vault` is set.
 Scoped to that vault's immutable id.
@@ -414,17 +421,17 @@ It honors that vault's `unmatched_host_policy`.
 It is not a second access-control plane.
 
 Policy CONNECT uses the same pre-hijack rules as an agent session in that vault.
-Continuation CONNECT still binds authority before hijack (section 5.2).
+Continuation CONNECT still binds authority before hijack ([section 4.2](#42-three-state-lifecycle)).
 
 A holder of the policy token can use the named vault the way the agent can, until the hop ends or 30 seconds, whichever is first.
 Naming a smaller vault shrinks that.
-See section 2.1.
+See [section 2.1](#21-choosing-policy_vault).
 
 On every inner request of a policy CONNECT tunnel, revalidate source authority.
 Observing a revoked or expired source burns that policy capability.
 Re-granting the actor cannot revive it within the original TTL.
 
-### 5.4 Revocation
+### 4.4 Revocation
 
 Thirty seconds is a maximum lifetime, not a post-revocation grace period.
 
@@ -444,7 +451,7 @@ Ordinary `agent revoke` takes effect on the next CONNECT, not on each request in
 Capabilities get the stronger guarantee because a shared row already exists and can be revalidated cheaply.
 Do not widen ordinary CONNECT revocation in this change.
 
-### 5.5 Source identity
+### 4.5 Source identity
 
 Persist the sessions-table hash (`sessions.id`).
 Never persist the raw token.
@@ -466,7 +473,7 @@ Checks inside the transition transaction:
 - agent or user still active
 - `GetVaultRole(actorID, sourceVaultID) != ""`
 
-### 5.6 Frozen match
+### 4.6 Frozen match
 
 A shared store cannot hold an in-process pointer.
 The match travels as a versioned, non-secret projection of the matched service.
@@ -513,7 +520,7 @@ No fallback to live Inject or re-match.
 | Filter block | Irrelevant. Continuation does not re-enter the filter. |
 | Key deleted from the vault | Fail closed, no origin. |
 
-### 5.7 Capability pairs are one invocation
+### 4.7 Capability pairs are one invocation
 
 Resolve the policy-vault scope first, then insert both rows in one transaction with the same `invocation_id`.
 A partial pair must never become visible.
@@ -529,7 +536,7 @@ The sidecar contract is synchronous.
 Returning its final response means the decision is complete.
 It may not retain a policy capability for asynchronous work afterwards.
 
-### 5.8 Rate limits and request logs
+### 4.8 Rate limits and request logs
 
 The initiating filtered request is charged once under the initiating actor and source vault.
 Its single-use continuation is the completion of that same logical request and is not charged a second time.
@@ -544,7 +551,7 @@ Logging follows the same distinction:
 - Policy calls are attributed to the initiator in the policy vault and record their own matched service and key names.
 - Raw session tokens, capability tokens, and credential values never enter logs, spans, metrics labels, or error text.
 
-## 6. Enforcement is mandatory
+## 5. Enforcement is mandatory
 
 Match, frozen-match resolution, capability claim, consume, and validate, source-authority revalidation, and policy-vault lookup are required interface members.
 Never guard them with an optional type assertion that means "skip the check when absent".
@@ -557,7 +564,7 @@ A continuation must never fall back to a live re-match if frozen resolution is u
 A service configured with a filter, on a proxy with no filter engine or no shared capability store, returns `502 filter_misconfigured`.
 "Cannot run the policy" must never resolve to "skip the policy".
 
-## 7. Skip or deny on the way back
+## 6. Skip or deny on the way back
 
 This is [The seam](#the-seam) rows 3 through 6.
 
@@ -565,14 +572,14 @@ This is [The seam](#the-seam) rows 3 through 6.
 - Continuation, bind does not hold: burn, 403 (or 400), no inject, no forward.
 - Filtered match, not a holding continuation: hop (agent session or policy token).
 
-## 8. The reverse-proxy hop
+## 7. The reverse-proxy hop
 
 Agent Vault calls the sidecar as an origin, the way a servlet container calls a filter.
 That is an ordinary HTTP request to `filter.url`, not CONNECT or absolute-form proxy language to the sidecar.
 
 The sidecar is not required to call back through Agent Vault.
 It may short-circuit or use its own credentials.
-If it wants vault-managed secrets, it may use Agent Vault's existing MITM as a client (section 5).
+If it wants vault-managed secrets, it may use Agent Vault's existing MITM as a client ([section 4](#4-the-two-capabilities)).
 
 Treat `filter.url` as an origin.
 Preserve method, path (joined with any `filter.url` path prefix), original request query, streaming body, and the original `Host`.
@@ -580,11 +587,11 @@ Overwrite hop headers.
 Never trust client copies of those headers.
 Secrets are not in URLs.
 
-### 8.1 Hop headers
+### 7.1 Hop headers
 
 Ordering is strip-then-set.
 
-Before the sidecar request, delete untrusted headers (section 8.2), then set:
+Before the sidecar request, delete untrusted headers ([section 7.2](#72-destination-credential-header-slots)), then set:
 
 | Header | Purpose |
 | --- | --- |
@@ -605,7 +612,7 @@ Otherwise the strip rule eats its own header.
 On the continuation request to origin, strip `X-Agent-Vault-*` again.
 That request is assembled by a sidecar that was just handed capability headers.
 
-### 8.2 Destination credential header slots
+### 7.2 Destination credential header slots
 
 Before sending to `filter.url`, derive the header names the frozen service would overwrite during Resolve.
 This is computable with no credential read:
@@ -623,7 +630,7 @@ Stripping it blindly loses that data and still leaks the slot that actually matt
 
 Continuation resolution still writes each injected header with `Set`, not `Add`, so injected values win over client-supplied duplicates.
 
-### 8.3 WebSocket
+### 7.3 WebSocket
 
 Reverse-proxy the upgrade and byte stream to the sidecar, preserving `Upgrade` / `Connection` on this hop.
 The sidecar either rejects, or opens a new WebSocket via the exact continuation and bridges.
@@ -636,7 +643,7 @@ A denied sidecar upgrade yields zero Resolve.
 After a successful origin upgrade, the existing 10-minute WS idle budget governs the bridge.
 Unfiltered services keep today's direct origin WS path.
 
-### 8.4 Dial policy
+### 7.4 Dial policy
 
 A dedicated per-service transport.
 It does not consult `AGENT_VAULT_ALLOW_PRIVATE_RANGES`.
@@ -662,7 +669,7 @@ Implement the property, do not merely assert it.
 An `http.Client` must set `CheckRedirect` to return `http.ErrUseLastResponse`.
 State in the code which mechanism provides it.
 
-### 8.5 Failure and success
+### 7.5 Failure and success
 
 | Failure | Response |
 | --- | --- |
@@ -680,7 +687,7 @@ A filter that consumes a non-replayable body must buffer before claiming the con
 
 Request-log rows for a filter hop carry the matched service identity and no credential keys.
 
-## 9. Layouts
+## 8. Layouts
 
 The sidecar listens on `:12345`.
 It is not a vault object and not an agent.
@@ -691,7 +698,7 @@ The protection API is a different, unfiltered service.
 
 The operator never types agent names, tokens, or `--filter-*` flags.
 
-### 9.1 Same-vault layout
+### 8.1 Same-vault layout
 
 `policy_vault` names the source vault.
 Omitting it would mean no side channel (the filter cannot call `api.github.com`).
@@ -716,7 +723,7 @@ services:
 ```
 
 Loopback HTTP needs no `allow_insecure_private_http`.
-A Compose sidecar should use `https://filter:12345` plus `ca` (section 2).
+A Compose sidecar should use `https://filter:12345` plus `ca` ([section 2](#2-config)).
 Cleartext `url: http://filter:12345` with `allow_insecure_private_http: true` remains available.
 
 | Who | Request | What happens |
@@ -729,7 +736,7 @@ Cleartext `url: http://filter:12345` with `allow_insecure_private_http: true` re
 | stolen policy cap -> unmatched public host | vault unmatched policy | Same as the agent (seam row 1). |
 | stolen policy cap -> other service in `dev` | residual until hop end or 30s | Same seam as the agent. Prefer the split-vault layout if that residual is unacceptable. |
 
-### 9.2 Split-vault layout
+### 8.2 Split-vault layout
 
 `policy_vault: policy`, holding only the read API, unfiltered.
 The configuring admin must be admin of both vaults.
@@ -767,14 +774,14 @@ services:
 - denial reaches neither origin nor credential store
 - allow reaches origin with the injected destination credential
 
-## 10. Implementation seam
+## 9. Implementation seam
 
-- `broker.Service`: `Filter {url, policy_vault, allow_insecure_private_http, ca}`, validation per section 2.2, no `agent_id`, a presence tri-state so `filter: null` survives the CLI -> API hop.
-- `proposal`: preserve `filter`, reject an explicit `filter` key, reject delete of a filtered service, reject shadowing matchers at create and apply (section 4).
+- `broker.Service`: `Filter {url, policy_vault, allow_insecure_private_http, ca}`, validation per [section 2.2](#22-filterurl-and-ca), no `agent_id`, a presence tri-state so `filter: null` survives the CLI -> API hop.
+- `proposal`: preserve `filter`, reject an explicit `filter` key, reject delete of a filtered service, reject shadowing matchers at create and apply ([section 3.1](#31-proposals-cannot-shadow-a-filtered-matcher)).
 - `brokercore`: Match vs Resolve as required interface members, frozen match freeze and thaw with a version envelope, no dest decrypt on the filter path, `av_cont_` / `av_pol_`, policy token follows [The seam](#the-seam) in the named vault.
 - `store`: capability table with constraints on kind and state, indexes on token hash, expiry, source-session hash, and invocation id, the three-state FSM, transactional pair minting, invocation correlation and retirement, scheduled sweep following the existing ticker-until-context-cancel pattern.
 - `mitm`: reverse-proxy to `filter.url`, admission-time claim on both ingress shapes, token vs proxy-URL headers, strip-then-set both directions, dedicated per-service dialer, filtered WS reverse-proxy plus continuation bridge, capability tokens accepted on the data plane only.
-- `server` / `cmd`: dual-admin when `policy_vault` differs, omitted `policy_vault` mints nothing, `AGENT_VAULT_FILTER_PROXY_URL` validated fatally at startup.
+- `server` / `cmd`: dual-admin when `policy_vault` differs, omitted `policy_vault` mints nothing, `AGENT_VAULT_MITM_ADDR` per [section 2.3](#23-agent_vault_mitm_addr).
 - CLI: none beyond YAML parse and print.
 - Docs: `docs/learn/services.mdx`, `docs/reference/cli.mdx`, `docs/self-hosting/environment-variables.mdx`, `.env.example`, `README.md`, `CLAUDE.md`, and `cmd/skill_cli.md`.
   Skill docs cover filter error codes.
@@ -785,7 +792,7 @@ Provide an opt-in live PostgreSQL integration test gated on a test DSN.
 Until that runs in CI, the PR must say the filter-capability path is executed on SQLite only.
 Do not let it read as tested.
 
-## 11. Tests
+## 10. Tests
 
 ### Blocking
 
@@ -797,7 +804,7 @@ Do not let it read as tested.
    Passthrough forwards with no inject.
    Deny does not contact origin.
 3. Policy CONNECT uses the same pre-hijack rules as an agent session in that vault.
-   Continuation CONNECT to the wrong authority still burns before hijack and leaf mint (section 5.2).
+   Continuation CONNECT to the wrong authority still burns before hijack and leaf mint ([section 4.2](#42-three-state-lifecycle)).
    A continuation path mismatch after an otherwise eligible CONNECT also fails closed.
 
 ### Capability lifecycle and revocation
@@ -835,7 +842,9 @@ Do not let it read as tested.
     A sidecar cannot spoof Agent Vault's own error header or set a client cookie.
 14. `filter.url` with userinfo, fragment, or query is rejected.
     `ca` on `http`, or malformed `ca`, is rejected.
-    Callback URL with userinfo, path, query, fragment, or non-loopback HTTP is rejected and is fatal at startup.
+    The advertised hop proxy URL is `AGENT_VAULT_MITM_ADDR` when set, otherwise `http://{AGENT_VAULT_ADDR host}:{mitm-port}`, with no userinfo.
+    A missing or wildcard ADDR host falls back to loopback.
+    An invalid explicit `AGENT_VAULT_MITM_ADDR` is fatal at startup.
     Redirects are returned, not followed.
 15. Full filtered WebSocket bridge: sidecar callback through the continuation, bidirectional frames, origin receives the injected credential, Resolve runs exactly once.
     An origin rejection after consume cannot make the continuation reusable.
@@ -852,13 +861,13 @@ Do not let it read as tested.
     A capability scope is always proxy-only.
 20. One filtered request plus its continuation consumes one proxy rate-limit unit.
     Policy calls consume their own units.
-    Request logs have initiator, vault, service, and key-name attribution as specified in section 5.8, with no raw tokens or credential values.
+    Request logs have initiator, vault, service, and key-name attribution as specified in [section 4.8](#48-rate-limits-and-request-logs), with no raw tokens or credential values.
 21. Escaped path and raw query are preserved on the sidecar hop and compared byte-for-byte on continuation, including encoded slashes and repeated query keys.
 
-## 12. Out of scope
+## 11. Out of scope
 
 - Changing global matcher semantics so any overlapping filtered matcher always hops.
-  Section 4 is proposal-only.
+  [Section 3.1](#31-proposals-cannot-shadow-a-filtered-matcher) is proposal-only.
 - Widening revocation to ordinary established unfiltered CONNECT tunnels.
 - Rewriting the frozen projection as raw `broker.Service` JSON, or including `Filter` in it.
 - A TTL flag or env override.
@@ -869,7 +878,7 @@ Do not let it read as tested.
 - A named `ca.<name>` catalog.
   YAML anchors are the DRY mechanism. Each stored service keeps its own PEM.
 
-## 13. Locked decisions
+## 12. Locked decisions
 
 1. Reverse-proxy to the sidecar, not a chained forward-proxy, not in-process.
 2. Per matched service only.
@@ -897,10 +906,11 @@ Do not let it read as tested.
 8. Fail closed on hop, capability, Match, snapshot, or missing-engine failure.
    502/504 with the existing JSON envelope.
    A configured filter that cannot be run is never a bypass.
-9. Reserved headers as listed in section 8, per-kind token prefixes (`av_cont_`, `av_pol_`), strip-then-set in both directions, tokens never in URLs.
-10. `filter.url`, `filter.ca`, and `AGENT_VAULT_FILTER_PROXY_URL` validated per sections 2.2 and 2.3.
-    An invalid callback URL is fatal at startup.
-    Dedicated dialer per section 8.4, including pinned `ca` roots and no skip-verify.
+9. Reserved headers as listed in [section 7](#7-the-reverse-proxy-hop), per-kind token prefixes (`av_cont_`, `av_pol_`), strip-then-set in both directions, tokens never in URLs.
+10. `filter.url` and `filter.ca` validated per [section 2.2](#22-filterurl-and-ca).
+    `AGENT_VAULT_MITM_ADDR` per [section 2.3](#23-agent_vault_mitm_addr): advertise only, not a bind.
+    An invalid explicit value is fatal at startup.
+    Dedicated dialer per [section 7.4](#74-dial-policy), including pinned `ca` roots and no skip-verify.
     Redirects implemented as not-followed.
 11. Filtered WebSocket upgrades hop to the sidecar.
     The exact continuation upgrade request is consumed before Resolve and origin dial, and is not restored if the origin rejects the upgrade.
@@ -920,28 +930,28 @@ Do not let it read as tested.
     Scheduled sweeper is hygiene, not correctness.
 16. Source revocation, expiry, or removal invalidates issued capabilities immediately.
     Re-checked on policy auth, continuation claim and consume, and every request inside a persistent CONNECT tunnel.
-    Stricter than the unfiltered path by design (section 5.4).
+    Stricter than the unfiltered path by design ([section 4.4](#44-revocation)).
 17. The frozen projection carries matcher identity and complete non-secret auth and substitution shape, never credential values, and excludes `Filter`.
     Do not re-run the matcher.
     Resolve current values for frozen key names.
     Version-first decode.
     Unknown version fails closed before any credential read.
 18. No RFC 9457 in this change.
-19. Proposals may not introduce a matcher that wins or ties an existing filtered service, checked at create and apply with exact matcher-language overlap (section 4).
+19. Proposals may not introduce a matcher that wins or ties an existing filtered service, checked at create and apply with exact matcher-language overlap ([section 3.1](#31-proposals-cannot-shadow-a-filtered-matcher)).
     Proposal-only.
     Admin YAML may author exceptions.
 20. A policy token is a short lease of the initiating actor on the named vault and follows [The seam](#the-seam).
-    Policy CONNECT uses the same pre-hijack rules as an agent session in that vault (section 5.3).
+    Policy CONNECT uses the same pre-hijack rules as an agent session in that vault ([section 4.3](#43-policy-capability)).
 21. Continuations are claimed at admission against the bound authority, before hijack.
     Consume requires state `claimed`.
     Mismatches burn the row.
-    Source authority is revalidated inside the same transaction (section 5.2).
-22. Capability rows store the session token hash, never the raw token (section 5.5).
+    Source authority is revalidated inside the same transaction ([section 4.2](#42-three-state-lifecycle)).
+22. Capability rows store the session token hash, never the raw token ([section 4.5](#45-source-identity)).
 23. Security enforcement is mandatory by interface, and every error on the filter path fails closed.
-    No optional type assertions, no implicit in-memory production fallback, no fall-through to Inject (section 6).
+    No optional type assertions, no implicit in-memory production fallback, no fall-through to Inject ([section 5](#5-enforcement-is-mandatory)).
 24. Destination credential header slots, derived from the frozen auth configuration without reading values, are removed before the sidecar.
-    `Authorization` is not stripped unconditionally (section 8.2).
+    `Authorization` is not stripped unconditionally ([section 7.2](#72-destination-credential-header-slots)).
 25. A continuation and its optional policy capability are minted in one transaction with one indexed, non-authorizing invocation id and retired together.
-    The sidecar contract is synchronous (section 5.7).
+    The sidecar contract is synchronous ([section 4.7](#47-capability-pairs-are-one-invocation)).
 26. Filtered ingress is rate-limited once, continuation does not double-charge, and every policy request is charged.
-    Logs retain initiator, service, and key-name attribution without raw tokens or values (section 5.8).
+    Logs retain initiator, service, and key-name attribution without raw tokens or values ([section 4.8](#48-rate-limits-and-request-logs)).
